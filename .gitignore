@@ -25,6 +25,7 @@ dist/
 check_env.py
 *_probe.py
 *_probe.ps1
+sql/
 
 # --- тесты и инструменты ---
 .pytest_cache/
