@@ -4,7 +4,14 @@
 #   brands 1─N products 1─N product_sizes
 #   users  1─N cart_items  ──N─1── product_sizes
 #   users  1─N orders     1─N order_items
-# (orders/order_items — следующий модуль; здесь пять таблиц из metadata.)
+# Здесь все семь таблиц из metadata.
+#
+# Снимок цены против ссылки на цену:
+#   order_items.price_at_purchase — цена ОДНОЙ пары, зафиксированная на
+#   момент оформления. Это не ссылка на products.price и не сумма позиции:
+#   если товар подорожает, старая покупка не изменится в отчётах.
+#   orders.total — сумма всего заказа, тоже снимок; БД проверяет лишь,
+#   что он не отрицательный, а равенство сумме позиций обеспечивает код.
 #
 # Связи описаны на трёх уровнях, и это разные вещи:
 #   1) ForeignKey("brands.id") — ограничение В БД: колонка brand_id может
@@ -36,6 +43,7 @@ from sqlalchemy import (
     UniqueConstraint,
     false,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -149,6 +157,9 @@ class User(Base):
     cart_items: Mapped[list["CartItem"]] = relationship(
         back_populates="user",
     )
+    orders: Mapped[list["Order"]] = relationship(
+        back_populates="user",
+    )
 
 
 class CartItem(Base):
@@ -186,4 +197,81 @@ class CartItem(Base):
     # Связь односторонняя: обратной коллекции у ProductSize нет.
     # Это не мешает позже добавить её без миграции — relationship
     # живёт только в Python и схему БД не меняет.
+    product_size: Mapped["ProductSize"] = relationship()
+
+
+class Order(Base):
+    """Заказ: «шапка» документа, позиции — в order_items.
+
+    total хранится в таблице, а не вычисляется из позиций при чтении:
+    это снимок суммы на момент оформления. Составных ограничений на связь
+    total и позиций в БД нет — их согласованность обеспечивает код
+    оформления заказа (следующие модули).
+    """
+
+    __tablename__ = "orders"
+    __table_args__ = (
+        # Статус — только из закрытого списка: опечатка вроде 'complete'
+        # не станет новым статусом, а будет отклонена.
+        CheckConstraint(
+            "status IN ('created', 'processing', 'completed')",
+            name="ck_order_status",
+        ),
+        # Отрицательная сумма — ошибка данных (скидки/возвраты
+        # в модели не выражены).
+        CheckConstraint("total >= 0", name="ck_order_total"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    # server_default на стороне БД: заказ, созданный без явного статуса,
+    # получает 'created' от PostgreSQL, независимо от того, какой код
+    # его вставил.
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'created'")
+    )
+    total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="orders",
+    )
+    items: Mapped[list["OrderItem"]] = relationship(
+        back_populates="order",
+    )
+
+
+class OrderItem(Base):
+    """Позиция заказа: сколько пар какого размера куплено и по какой цене.
+
+    price_at_purchase — цена ОДНОЙ пары на момент покупки (снимок),
+    а не текущая цена товара и не стоимость всей позиции.
+    Стоимость позиции = quantity * price_at_purchase, её считает код.
+    """
+
+    __tablename__ = "order_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_item_quantity"),
+        CheckConstraint("price_at_purchase > 0", name="ck_item_price"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    product_size_id: Mapped[int] = mapped_column(
+        ForeignKey("product_sizes.id"), nullable=False
+    )
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Деньги — Decimal: снимок цены обязан быть точным, иначе суммы
+    # заказов будут расходиться на копейки.
+    price_at_purchase: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False
+    )
+
+    order: Mapped["Order"] = relationship(
+        back_populates="items",
+    )
+    # Односторонняя связь, как и у CartItem: обратной коллекции
+    # у ProductSize нет.
     product_size: Mapped["ProductSize"] = relationship()
