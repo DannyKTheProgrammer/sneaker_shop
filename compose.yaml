@@ -1,0 +1,50 @@
+# Docker Compose для учебного бэкенда магазина кроссовок.
+# Проект: sneaker-practice-m01. Один сервис — одна БД PostgreSQL 17.
+#
+# Значения POSTGRES_* НЕ хранятся в этом файле, а берутся из окружения.
+# Compose автоматически подхватывает файл .env рядом с compose.yaml.
+# Синтаксис ${VAR:?сообщение} = жёсткая проверка наличия: если переменная
+# не задана (и нет в .env), команда завершится ошибкой ещё до создания
+# контейнеров. Это защита от запуска БД со слабым/пустым паролем.
+#
+# ВАЖНО: DATABASE_URL для Python (psycopg, Alembic) === значение
+# из .env; его нужно загрузить в процесс Python отдельно (python-dotenv /
+# pydantic-settings). Один .env — два разных потребителя.
+
+name: sneaker-practice-m01
+
+services:
+  db:
+    image: postgres:17
+    container_name: sneaker-practice-m01-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required (см. .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (см. .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required (см. .env.example)}
+    ports:
+      # 127.0.0.1 обязателен: порт доступен только с этого компьютера,
+      # а не всей локальной сети. 55433 — порт компьютера (хост),
+      # 5432 — порт postgres внутри контейнера/сети Compose.
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready отвечает, что сервер принимает подключения.
+      # $$ в Compose превращается в один $ внутри контейнера,
+      # поэтому проверяются именно переменные окружения контейнера,
+      # а не подстановка на стороне хоста.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1 -p 5432",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  # Именованный том: данные БД живут вне контейнера и переживают
+  # `docker compose down` / пересоздание контейнера.
+  pgdata:

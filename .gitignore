@@ -1,0 +1,44 @@
+# --- секреты и локальная конфигурация ---
+.env
+.env.*
+!.env.example
+
+# --- виртуальные окружения ---
+.venv/
+venv/
+sneaker_shop_.venv/
+env/
+ENV/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- временные вспомогательные скрипты практики ---
+check_env.py
+*_probe.py
+*_probe.ps1
+
+# --- тесты и инструменты ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- редакторы / ОС ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- локальные логи и дампы БД ---
+*.log
+*.sql.gz
