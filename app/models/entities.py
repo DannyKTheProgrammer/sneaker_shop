@@ -2,6 +2,10 @@
 #
 # Соответствие рисунку M1:
 #   brands 1─N products 1─N product_sizes
+#   users  1─N cart_items  ──N─1── product_sizes
+#   users  1─N orders     1─N order_items
+# (orders/order_items — следующий модуль; здесь пять таблиц из metadata.)
+#
 # Связи описаны на трёх уровнях, и это разные вещи:
 #   1) ForeignKey("brands.id") — ограничение В БД: колонка brand_id может
 #      содержать только существующий brands.id; вставка мусора отклоняется
@@ -21,6 +25,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -29,6 +34,7 @@ from sqlalchemy import (
     Numeric,
     Text,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -113,3 +119,71 @@ class ProductSize(Base):
     product: Mapped["Product"] = relationship(
         back_populates="sizes",
     )
+
+
+class User(Base):
+    """Покупатель.
+
+    В таблице лежит только хэш пароля (hashed_password), не сам пароль:
+    по БД нельзя восстановить исходный пароль пользователя.
+    Регистрации, выдачи токенов и проверки прав в этом модуле нет —
+    это только структура таблицы.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
+    # UNIQUE на уровне БД: два аккаунта с одним email невозможны,
+    # даже если проверку в коде случайно обойдут.
+    email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    hashed_password: Mapped[str] = mapped_column(Text, nullable=False)
+    # server_default false: обычный покупатель по умолчанию, админ —
+    # исключение, которое выставляется явно.
+    is_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=false()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    cart_items: Mapped[list["CartItem"]] = relationship(
+        back_populates="user",
+    )
+
+
+class CartItem(Base):
+    """Позиция корзины: сколько единиц конкретного размера хочет пользователь.
+
+    Ссылаемся на product_sizes, а не на products: заказ и корзина всегда
+    про конкретный размер, складской остаток тоже хранится по размеру.
+    """
+
+    __tablename__ = "cart_items"
+    __table_args__ = (
+        # Ноль и отрицательное количество — не «пустая позиция», а ошибка:
+        # чтобы убрать товар, строку удаляют.
+        CheckConstraint("quantity > 0", name="ck_cart_quantity"),
+        # Одна строка на пару (пользователь, размер). Составная уникальность
+        # НЕ суммирует quantity: повторная вставка такой пары будет отклонена
+        # базой, а не превратится в quantity = 1 + 1. Увеличение количества —
+        # это UPDATE существующей строки, отдельное действие в коде.
+        UniqueConstraint("user_id", "product_size_id", name="uq_cart_size"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
+    # Ссылка на владельца корзины: чьи это строки. Кто именно делает
+    # HTTP-запрос, из этой колонки не следует — её подставляет код
+    # приложения по аутентификации.
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    product_size_id: Mapped[int] = mapped_column(
+        ForeignKey("product_sizes.id"), nullable=False
+    )
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    user: Mapped["User"] = relationship(
+        back_populates="cart_items",
+    )
+    # Связь односторонняя: обратной коллекции у ProductSize нет.
+    # Это не мешает позже добавить её без миграции — relationship
+    # живёт только в Python и схему БД не меняет.
+    product_size: Mapped["ProductSize"] = relationship()
