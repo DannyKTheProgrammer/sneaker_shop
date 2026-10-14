@@ -27,7 +27,18 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Подставляем реальный URL из окружения/.env вместо значения из ini.
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Но если URL уже задан программно (Config.set_main_option в тестах или
+# скриптах приёмки), он главнее: иначе команду нельзя направить в другую
+# БД — миграция молча ушла бы в рабочую базу из .env.
+def _migration_url() -> str:
+    configured = config.get_main_option("sqlalchemy.url", None)
+    if configured:
+        return configured
+    config.set_main_option("sqlalchemy.url", settings.database_url)
+    return settings.database_url
+
+
+MIGRATION_URL = _migration_url()
 
 target_metadata = Base.metadata
 
@@ -41,7 +52,7 @@ COMPARE_OPTIONS = {
 def run_migrations_offline() -> None:
     """Offline-режим: SQL генерируется без подключения к БД."""
     context.configure(
-        url=settings.database_url,
+        url=MIGRATION_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},

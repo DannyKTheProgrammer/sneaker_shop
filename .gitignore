@@ -25,6 +25,8 @@ dist/
 check_env.py
 *_probe.py
 *_probe.ps1
+_http_acceptance.ps1
+_seed_acceptance.ps1
 sql/
 
 # --- тесты и инструменты ---
