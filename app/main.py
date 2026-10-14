@@ -1,7 +1,10 @@
 # Точка входа FastAPI.
 #
-# На этом шаге приложение умеет ровно одно: отвечать про доступность БД.
-# Ни create_all, ни таблиц, ни бизнес-маршрутов здесь нет намеренно.
+# M0.2: только проверка доступности БД (GET /health).
+# M2:   добавлено чтение каталога — GET /brands, GET /products,
+#       GET /products/{id}. Только чтение: POST/PUT/PATCH/DELETE не
+#       регистрируются до появления require_admin в M3.
+# Ни create_all, ни таблиц здесь нет: схему создают миграции Alembic.
 #
 # Замечание по эксплуатации: логи и сообщения этого модуля на русском,
 # а консоль Windows по умолчанию не UTF-8, поэтому при запуске без
@@ -16,6 +19,7 @@ from fastapi import FastAPI, Response, status
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import engine, ping
+from app.routers.catalog import router as catalog_router
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +44,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Sneaker Shop API (practice)",
-    version="0.1.0",
-    description="Учебный бэкенд магазина кроссовок. Текущий шаг: только проверка доступности БД.",
+    version="0.2.0",
+    description=(
+        "Учебный бэкенд магазина кроссовок. Текущий шаг: проверка доступности БД "
+        "и чтение каталога (бренды, товары, размеры)."
+    ),
     lifespan=lifespan,
 )
+
+app.include_router(catalog_router)
 
 
 @app.get(

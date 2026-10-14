@@ -27,6 +27,8 @@ check_env.py
 *_probe.ps1
 _http_acceptance.ps1
 _seed_acceptance.ps1
+_catalog_acceptance.ps1
+_logging.json
 sql/
 
 # --- тесты и инструменты ---
