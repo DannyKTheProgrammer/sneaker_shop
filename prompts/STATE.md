@@ -5,8 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: после
-M2 (чтение каталога: `GET /brands`, `GET /products`, `GET /products/{id}`).
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 1
+(контракт записи `ProductWrite`); HTTP-запись ждёт `require_admin`.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -58,7 +58,7 @@ alembic/versions/201c8afcccba_initial.py   единственная ревизи
 app/core/config.py      load_dotenv(override=False) + Settings.database_url (обязателен)
 app/database.py         один Engine, фабрика Session, ping() с SELECT 1
 app/main.py             FastAPI + GET /health + lifespan; подключает роутер каталога
-app/schemas/catalog.py  Pydantic-схемы ответов: BrandRead, ProductRead, ProductSizeRead (Decimal -> строка в JSON)
+app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/services/catalog.py чтение из БД: list_brands, list_products, get_product (selectinload!)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
 app/models/base.py      единственный DeclarativeBase
@@ -72,7 +72,8 @@ prompts/                тексты заданий модулей + этот ф
 `_review_m01_probe.py`, `_http_acceptance.ps1`, `_seed_probe.py`,
 `_seed_acceptance.ps1`, `_models_probe.py`, `_orders_probe.py`,
 `_schema_probe.py`, `_lifespan_probe.py`, `_acceptance_probe.ps1`,
-`_catalog_acceptance.ps1`, `_logging.json`, `check_env.py`, `sql/`.
+`_catalog_acceptance.ps1`, `_logging.json`, `_product_write_probe.py`,
+`check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -130,6 +131,9 @@ $env:DATABASE_URL / $env:POSTGRES_USER / $env:POSTGRES_PASSWORD — из .env
 # 3) HTTP-приёмка каталога M2 (API должен быть уже запущен отдельно)
 #    API: python -m uvicorn app.main:app --port 8000 --log-config _logging.json
 powershell -NoProfile -File _catalog_acceptance.ps1
+
+# 4) контракт записи ProductWrite (БД не нужна, HTTP-запись ещё закрыта)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _product_write_probe.py
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -174,6 +178,13 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 * **`price` и `size` в JSON — строки** (`"7990.00"`, `"42.0"`): так
   задумано, `json_encoders` в схемах переводит `Decimal` в строку без
   потери точности. Проверять в тестах надо строку, а не число.
+* **PostgreSQL молча округляет `numeric(10,2)`**: `0.001` превратится в
+  `0.00`, `10.999` — в `11.00`. Поэтому три знака после точки отклоняет
+  сам `ProductWrite` (`_validate_price`), иначе клиент получил бы товар по
+  цене, которую не называл. Проверено: `SELECT 0.001::numeric(10,2)` → `0.00`.
+* **`1E+2` в `price` принимается** и означает ровно 100 (дробных знаков
+  нет) — это не ошибка. Отклоняются `NaN`, `Infinity`, `0`, отрицательные,
+  три знака после точки и значения ≥ 100000000.
 
 ## Что уже проверено (и чем)
 
@@ -196,10 +207,26 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   товара (фильтр ещё не реализован), снимок БД до/после побайтово совпал
   (9 строк, включая `xmin`/`ctid`). SQL-лог: `/products` = один запрос за
   товарами + один `IN (10,20,30)` за размерами — N+1 нет.
+* M3 (часть 1, контракт записи): `_product_write_probe.py` → все 44
+  проверки пройдены. Валидные: пустые `description`/`image_url` дают `''`
+  и `null`, `name` обрезается `strip`, `0.01`, `99999999.99`, 2000 символов
+  описания и `brand_id=2147483647` принимаются. Невалидные → 422 с ошибкой
+  в нужном поле: отрицательная/нулевая/слишком точная цена, `NaN`,
+  `Infinity`, пробельное и пустое имя, имя > 120, `brand_id` ≤ 0,
+  > int32, отсутствующий или нечисловой, неверный URL, лишние поля
+  (`id`, `created_at`, `is_admin`, `sizes`), опечатка в имени поля.
+  `HttpUrl` → `str` перед колонкой `Text`. Записи по HTTP по-прежнему
+  закрыты: в OpenAPI только `get`.
 
 ## Чего ещё нет
 
-* Записи в каталог (POST/PUT/PATCH/DELETE) — ждут `require_admin` в M3.
+* Записи в каталог по HTTP: маршруты POST/PUT/PATCH/DELETE не
+  зарегистрированы до `require_admin` (M3, часть 2). `ProductWrite` готов и
+  проверен отдельно от HTTP.
+* `passlib[bcrypt]`, `python-jose`, хеширование паролей, выдача JWT,
+  `require_admin`, регистрация и вход — не установлены и не написаны.
+* Обработки «`brand_id` не существует» → 409: контракт это пропускает
+  (схема не ходит в БД), проверять будет сервис в M3, часть 2.
 * Фильтра `?brand_id=` у `/products` — параметр пока игнорируется.
 * Корзины, оформления заказа, регистрации и JWT — нет.
 * Постраничности (`total`, `limit`, `offset`) нет намеренно: массивы без
@@ -210,12 +237,10 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-Следующий модуль задаётся учеником (промпт в `prompts/`). Логичный
-порядок: M3 — `passlib[bcrypt]` + `python-jose`, регистрация/вход, JWT и
-`require_admin`, затем POST/PUT/DELETE каталога (только для админа),
-затем фильтр `?brand_id=` и пагинация, затем корзина, затем оформление
-заказа с транзакцией и контролем остатка.
-
-Важно: при M3 в `requirements.txt` добавятся `passlib[bcrypt]` и
-`python-jose` — их установка в venv потребует доступа к PyPI (из песочницы
-агента недоступен, ставить придётся вручную).
+M3, часть 2: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
+PyPI — из песочницы агента его нет, ставить вручную), сделать
+хеширование пароля, регистрацию и вход, JWT и зависимость `require_admin`,
+затем зарегистрировать POST/PUT/DELETE каталога только для админа, с
+проверкой существования бренда (нет бренда → 409) и товара (нет товара при
+PUT → 404). `ProductWrite` для этого уже готов. Дальше — фильтр
+`?brand_id=`, корзина, оформление заказа с транзакцией и контролем остатка.
