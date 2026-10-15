@@ -43,8 +43,14 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
   `template0`, `template1`).
 * API: версия приложения `0.2.0`, маршруты **только на чтение** —
   `GET /health`, `GET /brands`, `GET /products`, `GET /products/{id}`.
+  У `/products` есть фильтры и пагинация: `brand_id`, `min_price`,
+  `max_price`, `size`, `search`, `limit` (20, макс 100), `offset`.
   Записи (POST/PUT/PATCH/DELETE) не регистрируются до `require_admin` в M3.
-* Порт 8000 свободен, контейнер `db` запущен и healthy.
+* Порт 8000: ученик может держать на нём СВОЁ запущенное приложение
+  (наблюдалось: `python.exe` PID 16020, путь `C:\Python312\python.exe` —
+  системный Python, а не venv проекта). Это не осиротевший процесс, убивать
+  его не нужно: для приёмки либо договориться о перезапуске, либо взять
+  другой порт (`--port 8001`). Контейнер `db` запущен и healthy.
 
 ## Структура проекта
 
@@ -59,7 +65,8 @@ app/core/config.py      load_dotenv(override=False) + Settings.database_url (о�
 app/database.py         один Engine, фабрика Session, ping() с SELECT 1
 app/main.py             FastAPI + GET /health + lifespan; подключает роутер каталога
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
-app/services/catalog.py чтение из БД: list_brands, list_products, get_product (selectinload!)
+app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
+app/services/catalog.py чтение из БД: ProductFilters, list_brands, list_products (фильтры + limit/offset), get_product
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
@@ -134,6 +141,10 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 4) контракт записи ProductWrite (БД не нужна, HTTP-запись ещё закрыта)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _product_write_probe.py
+
+# 5) фильтры и пагинация GET /products (API запущен отдельно на --port 8001)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _catalog_filters_probe.py --port 8001 --database sneaker_shop
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _filters_empty_db_probe.py   # пустой каталог + 422
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -185,6 +196,13 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 * **`1E+2` в `price` принимается** и означает ровно 100 (дробных знаков
   нет) — это не ошибка. Отклоняются `NaN`, `Infinity`, `0`, отрицательные,
   три знака после точки и значения ≥ 100000000.
+* **`search` имеет тип `str | None`, и это обязательно**: `_strip`
+  превращает строку из одних пробелов в `None`, а Pydantic отверг бы
+  собственный результат, если объявить поле просто `str` (было 422 вместо
+  «фильтр не задан»).
+* **Приёмочные прогоны не должны зависеть от занятости порта**: ученик
+  может держать своё приложение на 8000, поэтому вспомогательные серверы
+  для приёмки поднимаются на 8001.
 
 ## Что уже проверено (и чем)
 
@@ -217,6 +235,21 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   (`id`, `created_at`, `is_admin`, `sizes`), опечатка в имени поля.
   `HttpUrl` → `str` перед колонкой `Text`. Записи по HTTP по-прежнему
   закрыты: в OpenAPI только `get`.
+* M3 (часть 2, фильтры и пагинация): `_catalog_filters_probe.py` —
+  все проверки пройдены на рабочей БД и повторены на свежей временной
+  (тот же seed, другая БД). `brand_id=1` → [10, 30]; цена 6000..8000 →
+  [10], границы включительные (`min=5990` → [10,20,30], `max=5990` → [20]);
+  `size=42` → [10, 30], `size=43` → [] (stock 0); `search=nOrTh` → [10, 30];
+  `brand_id=1&size=42&max_price=8000` → [10]; `brand_id=999` → [];
+  `search=%` → [] и `search=_` → [] (автоэкранирование); `limit=1` с
+  `offset=0/1/2` → [10]/[20]/[30]; `offset=99` → [];
+  422 на `limit=0`, `limit=101`, `offset=-1`, `size=-1`, `min_price=NaN`,
+  `min_price=10.999`, `min_price>max_price` — и на уровне схемы, и по HTTP.
+  SQL в логе: `WHERE EXISTS (SELECT 1 FROM product_sizes ...)` (без JOIN),
+  `ORDER BY products.id` перед `LIMIT/OFFSET`,
+  `ILIKE '%' || :name || '%' ESCAPE '/'`. `_filters_empty_db_probe.py`:
+  на пустом каталоге все фильтры дают `[]`, 422 те же, данные
+  восстановлены после `rollback`.
 
 ## Чего ещё нет
 
@@ -227,20 +260,22 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   `require_admin`, регистрация и вход — не установлены и не написаны.
 * Обработки «`brand_id` не существует» → 409: контракт это пропускает
   (схема не ходит в БД), проверять будет сервис в M3, часть 2.
-* Фильтра `?brand_id=` у `/products` — параметр пока игнорируется.
+* Фильтра по цене «в диапазоне» через отдельный параметр нет — есть два
+  (`min_price`/`max_price`), как в задании.
+* Постраничности с `total` нет намеренно: массивы без обёртки. Состав
+  страниц не гарантирован при параллельных вставках/удалениях
+  (keyset-пагинация — отдельная задача).
 * Корзины, оформления заказа, регистрации и JWT — нет.
-* Постраничности (`total`, `limit`, `offset`) нет намеренно: массивы без
-  обёртки, как в задании.
 * Каскадного удаления и обработчиков покупки нет намеренно.
 * Не проверялись: конкурентное списание остатка, гонка при оформлении,
   `ON DELETE` на практике, `alembic downgrade` в последнем прогоне.
 
 ## Следующий шаг
 
-M3, часть 2: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
+M3, часть 3: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
 PyPI — из песочницы агента его нет, ставить вручную), сделать
 хеширование пароля, регистрацию и вход, JWT и зависимость `require_admin`,
 затем зарегистрировать POST/PUT/DELETE каталога только для админа, с
 проверкой существования бренда (нет бренда → 409) и товара (нет товара при
-PUT → 404). `ProductWrite` для этого уже готов. Дальше — фильтр
-`?brand_id=`, корзина, оформление заказа с транзакцией и контролем остатка.
+PUT → 404). `ProductWrite` для этого уже готов. Дальше — корзина,
+оформление заказа с транзакцией и контролем остатка.

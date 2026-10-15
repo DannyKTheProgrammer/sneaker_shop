@@ -1,17 +1,13 @@
-# HTTP-маршруты каталога (M2).
-#
-# Здесь только чтение. POST/PUT/PATCH/DELETE не регистрируются намеренно:
-# изменять каталог сможет только администратор, а require_admin появится
-# в M3. Отсутствующий маршрут даёт 405 Method Not Allowed и ничего не
-# меняет в БД — это ожидаемое поведение текущего этапа, а не недоделка.
+# Фильтры каталога: маршрут GET /products.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_session
 from app.schemas.catalog import BrandRead, ProductRead
+from app.schemas.query import ProductFilters
 from app.services import catalog as catalog_service
 
 router = APIRouter(tags=["catalog"])
@@ -32,14 +28,33 @@ def list_brands(session: SessionDep) -> list[BrandRead]:
 
 
 @router.get("/products", response_model=list[ProductRead], summary="Список товаров")
-def list_products(session: SessionDep) -> list[ProductRead]:
-    """Вернуть все товары с размерами, отсортированные по id.
+def list_products(
+    session: SessionDep,
+    filters: Annotated[ProductFilters, Query()],
+) -> list[ProductRead]:
+    """Вернуть товары с размерами: фильтры через AND, сортировка по id, страница.
 
-    Фильтр по бренду появится позже; сейчас неизвестный параметр просто
-    игнорируется FastAPI, а неизвестный бренд в будущем фильтре даст
-    пустой массив, а не 404: «нет таких товаров» — не ошибка клиента.
+    Параметры (все необязательные, кроме limit/offset с значениями по умолчанию):
+
+    * `brand_id` — точное совпадение;
+    * `min_price` / `max_price` — включительные границы цены; `min_price`
+      больше `max_price` даёт 422 (проверяется в ProductFilters);
+    * `size` — есть размер с таким значением И остатком больше нуля
+      (правило наличия этого шага);
+    * `search` — подстрока в названии без учёта регистра, `%` и `_`
+      считаются буквальными символами;
+    * `limit` (по умолчанию 20, максимум 100) и `offset` (по умолчанию 0).
+
+    Неизвестный бренд или несуществующий размер — это пустой массив, а не
+    404: «ничего не найдено» не ошибка клиента. Некорректные значения
+    параметров (отрицательная цена, `NaN`, размер больше 999, три знака
+    после точки, `limit=0`, `offset=-1`) отклоняет Pydantic с 422 — до
+    обращения к БД.
+
+    Порядок ответа — по возрастанию `id`; состав страниц не гарантирован
+    при параллельных вставках и удалениях (см. пояснение в сервисе).
     """
-    return catalog_service.list_products(session)
+    return catalog_service.list_products(session, filters)
 
 
 @router.get(

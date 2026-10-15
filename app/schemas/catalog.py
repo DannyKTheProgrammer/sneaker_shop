@@ -13,17 +13,22 @@ from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
     Field,
     HttpUrl,
-    conint,
 )
 
 # brand_id ссылается на brands.id: Integer в PostgreSQL = 32 бита,
 # поэтому больше 2147483647 база всё равно не примет.
 BrandId = Annotated[int, Field(gt=0, le=2147483647)]
+
+# Границы для Numeric(10, 2): 10 знаков всего, 2 после точки,
+# значит целая часть — до 8 знаков.
+MONEY_MIN = Decimal("0")
+MONEY_MAX = Decimal("100000000")
 
 
 def _strip_name(value: Any) -> Any:
