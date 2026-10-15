@@ -83,7 +83,8 @@ prompts/                тексты заданий модулей + этот ф
 `_schema_probe.py`, `_lifespan_probe.py`, `_acceptance_probe.ps1`,
 `_catalog_acceptance.ps1`, `_logging.json`, `_product_write_probe.py`,
 `_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
-`_write_service_probe.py`, `check_env.py`, `sql/`.
+`_write_service_probe.py`, `_delete_service_probe.py`,
+`_m2_contract_review.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -154,6 +155,10 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 7) удаление товара delete_product (своя временная БД, заказ и корзина как ссылки)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _delete_service_probe.py
+
+# 8) независимое ревью контракта M2 (все чтения, фильтры, 404/409/422,
+#    фикстур: товар с тремя размерами, stock=0, буквальные % и _)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _m2_contract_review.py --port 8001 --database <имя>
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -289,6 +294,19 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   101/102, чужие размеры (201, 301) и корзина не тронуты, повторное
   удаление → `ProductNotFound`. FK в схеме остались те же 7, `ON DELETE
   CASCADE` нигде нет.
+* Ревью M2 (`_m2_contract_review.py`, отдельная временная БД, независимый
+  SQL для ожиданий): все проверки пройдены. Подтверждено: все публичные
+  чтения и ключи контракта; `Decimal` строками; 21 отказ 422 и 9 приёмов на
+  границах; AND-фильтры совпали с SQL; `stock > 0` (товар с нулевым
+  остатком не попадает); буквальные `%` и `_` (товар «100% cotton»
+  находится по `%`, «w_ld» — по `_`, а `wXld` — нет); товар с тремя
+  размерами выдан ровно один раз; страницы по 2 без пропусков и дублей;
+  404 на 999/0/-1; 405 на POST/PUT/PATCH/DELETE; удаление товара со
+  ссылкой из заказа — конфликт с сохранением товара, размеров и истории.
+  Мелкие правки по итогам: убраны неиспользуемые импорты `AfterValidator`
+  (`schemas/catalog.py`, `schemas/query.py`), обновлён устаревший заголовок
+  `routers/catalog.py`. После правок все три набора (ревью, фильтры, запись)
+  перезапущены — `ALL CHECKS PASSED`.
 
 ## Чего ещё нет
 
@@ -300,6 +318,14 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   `require_admin`, регистрация и вход — не установлены и не написаны.
 * HTTP-проверки записи (POST 201, PUT 200, DELETE 204/404/409) —
   ожидаемые, но не выполненные: маршрутов пока нет.
+* **Открытый пункт приёмки M3:** подключить запись через `require_admin` и
+  повторить POST/PUT/DELETE в четырёх режимах — без токена, с неверным
+  токеном, обычным пользователем, администратором. До этого требование
+  «CRUD только админу» принятым НЕ считается.
+* Мелочь на будущее: пустые query-параметры (`?limit=`, `?offset=`,
+  `?brand_id=`) дают 422, потому что пустая строка не парсится в int;
+  `?search=` при этом не сужает выдачу. Поведение зафиксировано, но в
+  задании не оговорено.
 * Фильтра по цене «в диапазоне» через отдельный параметр нет — есть два
   (`min_price`/`max_price`), как в задании.
 * Постраничности с `total` нет намеренно: массивы без обёртки. Состав
