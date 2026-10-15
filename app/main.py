@@ -65,10 +65,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Sneaker Shop API (practice)",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Учебный бэкенд магазина кроссовок. Текущий шаг: доступность БД, "
-        "чтение каталога (бренды, товары, размеры) и регистрация пользователя."
+        "чтение каталога, регистрация, вход с выдачей JWT (HS256)."
     ),
     lifespan=lifespan,
 )

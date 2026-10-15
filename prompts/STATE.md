@@ -5,8 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 6
-(вход и `app/core/security.py`); дальше — JWT и `require_admin`.
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 7
+(выдача и проверка JWT); дальше — `require_admin` и запись каталога.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -61,22 +61,27 @@ requirements.txt        зафиксированные fastapi, uvicorn, pydanti
 alembic.ini             конфиг Alembic БЕЗ строки подключения (секретов нет)
 alembic/env.py          URL берётся из Config.set_main_option, иначе из settings
 alembic/versions/201c8afcccba_initial.py   единственная ревизия: семь таблиц
-app/core/config.py      load_dotenv(override=False) + Settings.database_url (обязателен)
+app/core/config.py      load_dotenv(override=False); Settings: database_url и jwt_secret (SecretStr, оба обязательны),
+                        jwt_algorithm=HS256, jwt_expire_minutes=15, jwt_issuer/audience
 app/database.py         один Engine, фабрика Session, ping() с SELECT 1
 app/main.py             FastAPI + GET /health + lifespan; подключает роутеры каталога и auth,
                         плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
 app/core/security.py    пароли: CryptContext(bcrypt, rounds=12, truncate_error), validate_password,
-                        hash_password, verify_password, dummy_hash (для входа без утечки по времени)
+                        hash_password, verify_password, dummy_hash (для входа без утечки по времени);
+                        JWT: create_access_token / decode_access_token / InvalidToken (HS256, sub/exp/iat/iss/aud)
 app/schemas/auth.py     UserRegister/UserLogin (email+password, extra=forbid), UserRead, TokenResponse
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
                         create_product, update_product, delete_product
                         (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict/ProductDeletedConflict)
 app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
-                        authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email)
+                        authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email),
+                        get_user_by_id (проверка токена)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
-app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422)
+app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
+                        GET /auth/me (200/401), HTTPBearer + get_current_user/CurrentUser
+setup_jwt.py            генерация JWT_SECRET в .env без перезаписи существующего ключа
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
 app/models/__init__.py  экспорт Base и семи моделей
@@ -92,7 +97,7 @@ prompts/                тексты заданий модулей + этот ф
 `_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
 `_write_service_probe.py`, `_delete_service_probe.py`,
 `_m2_contract_review.py`, `_auth_register_probe.py`, `_auth_login_probe.py`,
-`check_env.py`, `sql/`.
+`_jwt_probe.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -173,7 +178,13 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 10) security.py и POST /auth/login (хэши, соль, UTF-8 > 72 байт, 401 без утечек)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _auth_login_probe.py --port 8001 --database <имя>
+
+# 11) JWT: выдача, срок, подпись, iss/aud, GET /auth/me, схема HTTPBearer
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _jwt_probe.py --port 8001 --database <имя>
 ```
+
+Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
+не перезаписывает, значение не печатает). Без ключа приложение не стартует.
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
 CHECKS PASSED`; `_http_acceptance.ps1` → `200 {"status":"ok"}` →
@@ -348,6 +359,22 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   dummy (разница < 1%), средние времени ответа 212 и 225 мс.
   Отказы не изменили данные. Все прежние наборы перезапущены после
   обновления ожиданий (появился `/auth/login`) — `ALL CHECKS PASSED`.
+* M3 (часть 7, JWT): `_jwt_probe.py` → все проверки пройдены. Настройки:
+  секрет из окружения/`.env` (64 символа), `SecretStr` не показывает значение
+  в repr и в ошибках валидации; без `JWT_SECRET` — `ValidationError:
+  jwt_secret Field required`, при коротком (< 32) — «JWT_SECRET must be at
+  least 32 characters; generate one with `python setup_jwt.py`».
+  `setup_jwt.py` в отдельном каталоге: без `.env` — понятная ошибка, с
+  пустым ключом — сгенерировал 66 символов, повтор не изменил файл
+  (хэш совпал). Вход отдаёт настоящий JWT: `alg=HS256`, `typ=JWT`,
+  `sub=str(user.id)`, `iss=sneaker-practice`, `aud=sneaker-api`, срок 900 c,
+  в claims только `aud/exp/iat/iss/sub` (нет пароля, хэша, роли, email),
+  `token_type=bearer`. `GET /auth/me`: 200 с валидным токеном, 401 и
+  `WWW-Authenticate: Bearer` без заголовка/с мусором, при изменённом
+  payload, чужом ключе, чужом `iss`/`aud`, отсутствии `sub`, после истечения
+  (токен на 1 с принят, через 2 с — 401) и для удалённого пользователя.
+  OpenAPI: схема `HTTPBearer` (OAuth2 нет), `/auth/me` защищён. Все прежние
+  наборы после обновления ожиданий — `ALL CHECKS PASSED`.
 
 ## Чего ещё нет
 
@@ -355,17 +382,18 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
   `create_product`/`update_product`/`delete_product` готовы и проверены
   вне HTTP.
-* Входа с выдачей токена нет: `POST /auth/login` проверяет пару email/пароль
-  и отдаёт `access_token=null`/`token_type=none` — JWT появится на
-  следующем шаге. Публичного маршрута назначения администратора нет:
-  `is_admin` выставляется явно в `False`.
-* `python-jose` установлен (3.5.0), но нигде не используется.
+* Вход выдаёт JWT (HS256, 15 минут), но `require_admin` ещё нет: админских
+  маршрутов и записи каталога по HTTP по-прежнему нет.
+* Публичного маршрута назначения администратора нет: `is_admin` выставляется
+  явно в `False` при регистрации.
 * HTTP-проверки записи каталога (POST 201, PUT 200, DELETE 204/404/409) —
   ожидаемые, но не выполненные: маршрутов пока нет.
 * **Открытый пункт приёмки M3:** подключить запись через `require_admin` и
   повторить POST/PUT/DELETE в четырёх режимах — без токена, с неверным
   токеном, обычным пользователем, администратором. До этого требование
   «CRUD только админу» принятым НЕ считается.
+* Swagger не умеет логиниться JSON-формой: `HTTPBearer` — это только поле
+  для вставки токена. Порядок: вызвать `/auth/login`, затем Authorize.
 * Постоянное время ответа входа не гарантируется: dummy_hash выравнивает
   только стоимость bcrypt, а сеть, БД и загрузка машины вносят свой вклад.
   Это записано и в docstring сервиса.
@@ -385,12 +413,11 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 7: выдача JWT через `python-jose` (3.5.0 уже установлен) —
-`access_token` в ответе входа вместо `null`, затем зависимость
-`require_admin` и регистрация POST/PUT/DELETE каталога только для админа
-(POST → 201, PUT → 200, DELETE → 204 с пустым телом, повторный DELETE →
-404) с переводом ошибок сервисов: `BrandNotFound` → 409,
-`ProductNotFound` → 404, `CatalogConflict`/`ProductDeletedConflict` → 409.
-Затем закрыть открытый пункт приёмки: POST/PUT/DELETE без токена, с неверным
-токеном, обычным пользователем и администратором.
+M3, часть 8: зависимость `require_admin` поверх `get_current_user` и
+регистрация POST/PUT/DELETE каталога только для админа (POST → 201,
+PUT → 200, DELETE → 204 с пустым телом, повторный DELETE → 404) с переводом
+ошибок сервисов: `BrandNotFound` → 409, `ProductNotFound` → 404,
+`CatalogConflict`/`ProductDeletedConflict` → 409. Затем закрыть открытый
+пункт приёмки: POST/PUT/DELETE без токена, с неверным токеном, обычным
+пользователем и администратором (403 для обычного, успех для админа).
 Дальше — корзина, оформление заказа с транзакцией и контролем остатка.

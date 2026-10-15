@@ -94,13 +94,16 @@ class UserLogin(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    """Ответ входа.
+    """Ответ входа: access token и безопасные поля пользователя.
 
-    Поле access_token пока всегда null: JWT появится следующим шагом.
-    Обещать токен, которого нет, нельзя, поэтому null честнее пустой
-    строки. Сам ответ — UserRead, то есть без хэша пароля.
+    token_type = "bearer" — так клиент понимает, что токен кладётся в
+    заголовок `Authorization: Bearer <access_token>`.
+
+    Поле user оставлено для удобства (клиенту не нужен отдельный запрос,
+    чтобы узнать id и email), но оно не часть токена: в самом JWT лежат
+    только sub/exp/iat/iss/aud — без пароля, хэша и признака роли.
     """
 
-    access_token: str | None
+    access_token: str
     token_type: str
     user: UserRead

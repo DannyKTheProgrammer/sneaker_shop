@@ -82,6 +82,15 @@ def register_user(session: Session, data: UserRegister) -> User:
     return user
 
 
+def get_user_by_id(session: Session, user_id: int) -> User | None:
+    """Найти пользователя по id (для проверки токена).
+
+    None, а не исключение: решение «401 или 200» принимает зависимость
+    аутентификации, а не сервис.
+    """
+    return session.get(User, user_id)
+
+
 def authenticate_user(session: Session, data: UserLogin) -> User:
     """Проверить пару email/пароль и вернуть пользователя.
 

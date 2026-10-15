@@ -1,21 +1,68 @@
-# Маршруты аутентификации (M3: регистрация и вход).
+# Маршруты аутентификации (M3: регистрация, вход и проверка токена).
 #
-# Выдачи JWT здесь пока нет — вход подтверждает пару email/пароль и
-# возвращает пользователя с access_token=null. Админские маршруты каталога
-# появятся вместе с require_admin на следующем шаге.
+# Контракт входа — JSON {"email", "password"} → {"access_token", "token_type"}.
+# Это НЕ OAuth2 password form: в Swagger нельзя нажать Authorize и войти
+# автоматически. Порядок такой: вызвать /auth/login, скопировать
+# access_token и вставить его в Authorize (схема HTTPBearer).
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.core.security import InvalidToken, create_access_token, decode_access_token
 from app.database import get_session
+from app.models import User
 from app.schemas.auth import TokenResponse, UserLogin, UserRead, UserRegister
 from app.services import auth as auth_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 SessionDep = Annotated[Session, Depends(get_session)]
+
+# Схема безопасности для OpenAPI: поле для токена в Authorize.
+# auto_error=False — чтобы отсутствие заголовка давало наш 401 с
+# WWW-Authenticate, а не встроенный 403 без пояснений.
+bearer_scheme = HTTPBearer(auto_error=False, description="Вставьте access_token из /auth/login")
+
+# Один и тот же заголовок для всех отказов доступа.
+WWW_AUTHENTICATE = {"WWW-Authenticate": "Bearer"}
+
+
+def _unauthorized(detail: str = "Could not validate credentials") -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers=WWW_AUTHENTICATE,
+    )
+
+
+def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+    session: SessionDep,
+) -> User:
+    """Пользователь из access token.
+
+    Проверяется подпись, срок действия, издатель и аудитория — всё в
+    decode_access_token. Затем пользователь перечитывается из БД: если его
+    удалили, токен перестаёт работать, хотя подпись ещё валидна.
+    """
+    if credentials is None or not credentials.credentials:
+        raise _unauthorized("Not authenticated")
+    try:
+        user_id = decode_access_token(credentials.credentials)
+    except InvalidToken as exc:
+        raise _unauthorized() from exc
+
+    user = auth_service.get_user_by_id(session, user_id)
+    if user is None:
+        # Токен подписан нами, но пользователя больше нет.
+        raise _unauthorized()
+    return user
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 @router.post(
@@ -60,7 +107,7 @@ def register(payload: UserRegister, session: SessionDep) -> UserRead:
     },
 )
 def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
-    """Проверить пару email/пароль.
+    """Проверить пару email/пароль и выдать access token.
 
     Пароль сверяется с сохранённым хэшем через `verify_password` (соль
     внутри хэша, поэтому повторное вычисление и сравнение строк не
@@ -68,8 +115,13 @@ def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
     против dummy_hash, и ответ тот же самый — 401 без подробностей: по
     ответу нельзя понять, существует ли такой адрес.
 
-    Токена пока нет: `access_token` = null, `token_type` = "none". JWT —
-    следующий шаг; выдумывать несуществующий токен не будем.
+    Успех: 200 и JSON `{"access_token": "<jwt>", "token_type": "bearer",
+    "user": {...}}`. Токен подписан HS256, живёт 15 минут, sub = id
+    пользователя, iss = sneaker-practice, aud = sneaker-api. Пароля, хэша
+    и признака роли в токене нет.
+
+    Это не OAuth2 password flow: Swagger не умеет логиниться этой формой.
+    Сначала вызовите /auth/login, затем вставьте access_token в Authorize.
     """
     try:
         user = auth_service.authenticate_user(session, payload)
@@ -77,7 +129,28 @@ def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+            headers=WWW_AUTHENTICATE,
         ) from exc
 
-    return TokenResponse(access_token=None, token_type="none", user=UserRead.model_validate(user))
+    return TokenResponse(
+        access_token=create_access_token(user.id),
+        token_type="bearer",
+        user=UserRead.model_validate(user),
+    )
+
+
+@router.get(
+    "/me",
+    response_model=UserRead,
+    summary="Текущий пользователь по access token",
+    responses={401: {"description": "Токен отсутствует, просрочен или подделан"}},
+)
+def read_me(current_user: CurrentUser) -> UserRead:
+    """Вернуть пользователя, которому принадлежит предъявленный токен.
+
+    Маршрут существует как рабочая проверка защищённого доступа: он
+    отвечает 200 только с валидным токеном и 401 во всех остальных
+    случаях (нет заголовка, битая подпись, истёк срок, удалённый
+    пользователь). Он же демонстрирует схему HTTPBearer в OpenAPI.
+    """
+    return current_user

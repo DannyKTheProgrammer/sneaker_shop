@@ -11,9 +11,13 @@
 # verify_password(введённый_пароль, сохранённый_хэш) — passlib сам достанет
 # соль из сохранённой строки и повторит вычисление.
 
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 
+from jose import JWTError, jwt
 from passlib.context import CryptContext
+
+from app.core.config import settings
 
 # bcrypt__rounds=12 — стоимость (2^12 итераций), фиксируем явно, чтобы она
 # не «поехала» от обновления библиотеки.
@@ -106,3 +110,69 @@ def _dummy_hash() -> str:
 def dummy_hash() -> str:
     """Публичный доступ к хэшу-заглушке (нужен сервису входа)."""
     return _dummy_hash()
+
+
+# --- JWT (M3) -------------------------------------------------------------
+#
+# Токен подписывается HS256 секретом из настроек (JWT_SECRET в .env или
+# окружении). Запасного ключа в коде нет: если секрет не задан, приложение
+# не стартует — это лучше, чем молча подписывать токены известным всем
+# ключом.
+#
+# В claims кладём только то, что нужно для доступа: sub (id пользователя),
+# exp, iat, iss, aud. Пароля, его хэша и признака роли там нет: токен —
+# не место для секретов, а роль всё равно проверяется по БД при каждом
+# запросе, поэтому устаревший токен не даст лишних прав.
+
+
+class InvalidToken(Exception):
+    """Токен отсутствует, просрочен, подделан или относится к другому приложению."""
+
+
+def create_access_token(user_id: int, expires_delta: timedelta | None = None) -> str:
+    """Подписать access token для пользователя.
+
+    expires_delta можно передать явно — это нужно проверкам срока действия
+    (например, токен, который истекает через секунду).
+    """
+    now = datetime.now(UTC)
+    lifetime = expires_delta or timedelta(minutes=settings.jwt_expire_minutes)
+    payload = {
+        "sub": str(user_id),
+        "iat": int(now.timestamp()),
+        "exp": int((now + lifetime).timestamp()),
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+    }
+    return jwt.encode(
+        payload,
+        settings.jwt_secret.get_secret_value(),
+        algorithm=settings.jwt_algorithm,
+    )
+
+
+def decode_access_token(token: str) -> int:
+    """Проверить подпись и claims и вернуть id пользователя из sub.
+
+    Проверяются: подпись, exp (истечение), iss и aud. Любая проблема —
+    InvalidToken без подробностей: клиенту не нужно знать, что именно не
+    так с токеном, а разные тексты помогли бы перебирать варианты.
+    """
+    try:
+        claims = jwt.decode(
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=[settings.jwt_algorithm],
+            audience=settings.jwt_audience,
+            issuer=settings.jwt_issuer,
+        )
+    except JWTError as exc:
+        raise InvalidToken("access token is invalid or expired") from exc
+
+    subject = claims.get("sub")
+    if subject is None:
+        raise InvalidToken("access token has no subject")
+    try:
+        return int(subject)
+    except (TypeError, ValueError) as exc:
+        raise InvalidToken("access token subject is not a user id") from exc
