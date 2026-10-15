@@ -5,8 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 5
-(регистрация `POST /auth/register`); дальше — вход/JWT и `require_admin`.
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 6
+(вход и `app/core/security.py`); дальше — JWT и `require_admin`.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -67,14 +67,16 @@ app/main.py             FastAPI + GET /health + lifespan; подключает �
                         плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
-app/schemas/auth.py     UserRegister (email+password, extra=forbid) и UserRead (id/email/is_admin)
+app/core/security.py    пароли: CryptContext(bcrypt, rounds=12, truncate_error), validate_password,
+                        hash_password, verify_password, dummy_hash (для входа без утечки по времени)
+app/schemas/auth.py     UserRegister/UserLogin (email+password, extra=forbid), UserRead, TokenResponse
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
                         create_product, update_product, delete_product
                         (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict/ProductDeletedConflict)
-app/services/auth.py    CryptContext(bcrypt, rounds=12, truncate_error), hash_password, verify_password,
-                        register_user (+ EmailAlreadyRegistered), разбор IntegrityError 23505
+app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
+                        authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
-app/routers/auth.py     POST /auth/register (201/409/422)
+app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422)
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
 app/models/__init__.py  экспорт Base и семи моделей
@@ -89,7 +91,8 @@ prompts/                тексты заданий модулей + этот ф
 `_catalog_acceptance.ps1`, `_logging.json`, `_product_write_probe.py`,
 `_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
 `_write_service_probe.py`, `_delete_service_probe.py`,
-`_m2_contract_review.py`, `_auth_register_probe.py`, `check_env.py`, `sql/`.
+`_m2_contract_review.py`, `_auth_register_probe.py`, `_auth_login_probe.py`,
+`check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -167,6 +170,9 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 9) регистрация POST /auth/register (API на 8001, своя временная БД)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _auth_register_probe.py --port 8001 --database <имя>
+
+# 10) security.py и POST /auth/login (хэши, соль, UTF-8 > 72 байт, 401 без утечек)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _auth_login_probe.py --port 8001 --database <имя>
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -328,6 +334,20 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   того же нормализованного email на уровне сервиса → `EmailAlreadyRegistered`
   (UNIQUE в БД, а не предварительный SELECT); маршрута login и назначения
   администратора нет. Регрессия M2 после этого прогнана — `ALL CHECKS PASSED`.
+* M3 (часть 6, вход и security.py): `_auth_login_probe.py` → все проверки
+  пройдены. `app/core/security.py`: правильный пароль → True, неверный →
+  False, пустой и битый хэш → False (без исключения), два хэша одного
+  пароля различаются (соль), оба проверяются; ASCII 73 символа и кириллица
+  40 символов (80 байт) отклоняются **до** хэширования (`PasswordTooLong`),
+  кириллица 20 символов (40 байт) принимается; NUL отклонён. `dummy_hash`
+  стабилен. `POST /auth/login`: верная пара → 200
+  (`access_token=null`, `token_type=none`, `user` без хэша), неверный пароль
+  и отсутствующий email → одинаковые 401 `Invalid email or password` с
+  `WWW-Authenticate: Bearer`; 422 без утечки пароля (в том числе кириллица
+  80 байт). Замеры: bcrypt 208 мс против хэша пользователя и 207 мс против
+  dummy (разница < 1%), средние времени ответа 212 и 225 мс.
+  Отказы не изменили данные. Все прежние наборы перезапущены после
+  обновления ожиданий (появился `/auth/login`) — `ALL CHECKS PASSED`.
 
 ## Чего ещё нет
 
@@ -335,16 +355,20 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
   `create_product`/`update_product`/`delete_product` готовы и проверены
   вне HTTP.
-* Входа (login) и выдачи JWT нет: есть только регистрация. Публичного
-  маршрута назначения администратора нет и не планируется — `is_admin`
-  выставляется явно в `False`.
+* Входа с выдачей токена нет: `POST /auth/login` проверяет пару email/пароль
+  и отдаёт `access_token=null`/`token_type=none` — JWT появится на
+  следующем шаге. Публичного маршрута назначения администратора нет:
+  `is_admin` выставляется явно в `False`.
 * `python-jose` установлен (3.5.0), но нигде не используется.
-* HTTP-проверки записи (POST 201, PUT 200, DELETE 204/404/409) —
+* HTTP-проверки записи каталога (POST 201, PUT 200, DELETE 204/404/409) —
   ожидаемые, но не выполненные: маршрутов пока нет.
 * **Открытый пункт приёмки M3:** подключить запись через `require_admin` и
   повторить POST/PUT/DELETE в четырёх режимах — без токена, с неверным
   токеном, обычным пользователем, администратором. До этого требование
   «CRUD только админу» принятым НЕ считается.
+* Постоянное время ответа входа не гарантируется: dummy_hash выравнивает
+  только стоимость bcrypt, а сеть, БД и загрузка машины вносят свой вклад.
+  Это записано и в docstring сервиса.
 * Мелочь на будущее: пустые query-параметры (`?limit=`, `?offset=`,
   `?brand_id=`) дают 422, потому что пустая строка не парсится в int;
   `?search=` при этом не сужает выдачу. Поведение зафиксировано, но в
@@ -361,12 +385,12 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 6: вход (`POST /auth/login`), выдача JWT через `python-jose`
-(3.5.0 уже установлен), зависимость `require_admin`, затем регистрация
-POST/PUT/DELETE каталога только для админа (POST → 201, PUT → 200,
-DELETE → 204 с пустым телом, повторный DELETE → 404) и перевод ошибок
-сервисов: `BrandNotFound` → 409, `ProductNotFound` → 404,
-`CatalogConflict`/`ProductDeletedConflict` → 409. Затем закрыть открытый
-пункт приёмки: POST/PUT/DELETE без токена, с неверным токеном, обычным
-пользователем и администратором.
+M3, часть 7: выдача JWT через `python-jose` (3.5.0 уже установлен) —
+`access_token` в ответе входа вместо `null`, затем зависимость
+`require_admin` и регистрация POST/PUT/DELETE каталога только для админа
+(POST → 201, PUT → 200, DELETE → 204 с пустым телом, повторный DELETE →
+404) с переводом ошибок сервисов: `BrandNotFound` → 409,
+`ProductNotFound` → 404, `CatalogConflict`/`ProductDeletedConflict` → 409.
+Затем закрыть открытый пункт приёмки: POST/PUT/DELETE без токена, с неверным
+токеном, обычным пользователем и администратором.
 Дальше — корзина, оформление заказа с транзакцией и контролем остатка.

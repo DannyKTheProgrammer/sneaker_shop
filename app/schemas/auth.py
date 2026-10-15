@@ -14,13 +14,7 @@ from pydantic import (
     Field,
 )
 
-# Ограничения bcrypt: он принимает пароль строкой, но использует только
-# первые 72 БАЙТА UTF-8. Кириллица в UTF-8 занимает 2 байта на символ,
-# поэтому 72 символа — это ещё не 72 байта. Проверяем и то, и другое,
-# иначе bcrypt молча обрежет пароль (или с truncate_error=True упадёт
-# невнятной ошибкой уже внутри хэширования).
-PASSWORD_MIN_LENGTH = 8
-PASSWORD_MAX_BYTES = 72
+from app.core.security import PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH, validate_password
 
 
 def _normalize_email(value: Any) -> Any:
@@ -34,23 +28,28 @@ def _normalize_email(value: Any) -> Any:
 
 
 def _validate_password(value: Any) -> Any:
-    """Проверить длину в символах и в байтах UTF-8, запретить NUL.
+    """Отклонить непригодный пароль ДО хэширования.
 
-    NUL-байт нельзя пропускать: строка обрывается на нём в C-библиотеках
-    (bcrypt в их числе), и пароль «abc\\x00def» вёл бы себя как «abc».
+    Сама логика — в app/core/security.validate_password, чтобы правило было
+    одно на весь проект: длина в символах, длина в байтах UTF-8 (предел
+    bcrypt) и запрет NUL. Здесь только адаптация под валидатор Pydantic.
+
+    Про NUL: он не «просто некрасивый символ» — строка обрывается на нём в
+    C-библиотеках (bcrypt в их числе), а passlib на таком пароле поднимает
+    PasswordValueError, что без нашей проверки дало бы 500 вместо 422.
     """
     if not isinstance(value, str):
         return value  # тип проверит Pydantic своими сообщениями
-    if len(value) < PASSWORD_MIN_LENGTH:
-        raise ValueError(f"password must be at least {PASSWORD_MIN_LENGTH} characters")
-    if len(value.encode("utf-8")) > PASSWORD_MAX_BYTES:
-        raise ValueError(
-            f"password must be at most {PASSWORD_MAX_BYTES} bytes in UTF-8 "
-            "(bcrypt uses only the first 72 bytes)"
-        )
-    if "\x00" in value:
-        raise ValueError("password must not contain NUL characters")
-    return value
+    return validate_password(value)
+
+
+# Переиспользуемые аннотированные типы для полей пароля.
+PasswordField = Annotated[
+    str,
+    Field(min_length=PASSWORD_MIN_LENGTH, max_length=72),
+    BeforeValidator(_validate_password),
+]
+EmailField = Annotated[EmailStr, BeforeValidator(_normalize_email)]
 
 
 class UserRead(BaseModel):
@@ -77,11 +76,31 @@ class UserRegister(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    email: Annotated[EmailStr, BeforeValidator(_normalize_email)]
-    # max_length=72 символов — грубая рамка, точную (по байтам) делает
-    # _validate_password.
-    password: Annotated[
-        str,
-        Field(min_length=PASSWORD_MIN_LENGTH, max_length=72),
-        BeforeValidator(_validate_password),
-    ]
+    email: EmailField
+    password: PasswordField
+
+
+class UserLogin(BaseModel):
+    """Вход POST /auth/login: те же два поля и та же нормализация email.
+
+    Именно поэтому вход ищет пользователя по нормализованному адресу:
+    регистрация записала ровно такое значение.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailField
+    password: PasswordField
+
+
+class TokenResponse(BaseModel):
+    """Ответ входа.
+
+    Поле access_token пока всегда null: JWT появится следующим шагом.
+    Обещать токен, которого нет, нельзя, поэтому null честнее пустой
+    строки. Сам ответ — UserRead, то есть без хэша пароля.
+    """
+
+    access_token: str | None
+    token_type: str
+    user: UserRead

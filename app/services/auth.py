@@ -1,56 +1,38 @@
-# Регистрация пользователей: хэширование пароля и запись в БД (M3).
+# Аутентификация: регистрация и вход (M3).
 #
 # Здесь нет ни FastAPI, ни HTTP-кодов: сервис отвечает за пароль и за
-# строку в таблице users, а «201/409/422» решает роутер.
+# строку в таблице users, а «201/401/409/422» решает роутер.
+#
+# Криптография пароля живёт в app/core/security.py и вызывается оттуда:
+# этот модуль отвечает только за БД и правила доступа.
 
-from passlib.context import CryptContext
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.security import dummy_hash, hash_password, verify_password
 from app.models import User
-from app.schemas.auth import UserRegister
-
-# bcrypt__rounds=12 — стоимость хэширования (2^12 итераций): подобрать
-# пароль перебором заметно дороже, чем при стандартных 12 в старых
-# версиях... значение фиксируем явно, чтобы оно не «поехало» от апгрейда
-# библиотеки.
-# bcrypt__truncate_error=True — если пароль длиннее 72 байт, passlib
-# поднимет ошибку, а не обрежет его молча. Схему длины мы уже проверили в
-# Pydantic, это вторая линия защиты.
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    bcrypt__rounds=12,
-    bcrypt__truncate_error=True,
-)
+from app.schemas.auth import UserLogin, UserRegister
 
 # SQLSTATE нарушения уникальности в PostgreSQL.
 UNIQUE_VIOLATION = "23505"
 
+# Одно и то же сообщение для «нет такого email» и «неверный пароль»:
+# разные тексты позволили бы перебором выяснять, какие адреса
+# зарегистрированы.
+INVALID_CREDENTIALS_MESSAGE = "Invalid email or password"
+
 
 class AuthError(Exception):
-    """Ошибка регистрации, которую роутер переводит в HTTP-ответ."""
+    """Ошибка аутентификации, которую роутер переводит в HTTP-ответ."""
 
 
 class EmailAlreadyRegistered(AuthError):
     """Нормализованный email уже занят."""
 
 
-def hash_password(password: str) -> str:
-    """Хэш пароля (bcrypt). Открытый пароль нигде не сохраняется."""
-    return pwd_context.hash(password)
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    """Проверить пароль против хэша.
-
-    Нужна для будущего входа и для проверок: «хэш в БД действительно от
-    этого пароля». При неверном пароле или битом хэше возвращает False,
-    а не исключение.
-    """
-    try:
-        return pwd_context.verify(password, password_hash)
-    except ValueError:
-        return False
+class InvalidCredentials(AuthError):
+    """Пользователь не найден ИЛИ пароль не подошёл — без уточнений."""
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:
@@ -97,4 +79,32 @@ def register_user(session: Session, data: UserRegister) -> User:
         raise
 
     session.commit()
+    return user
+
+
+def authenticate_user(session: Session, data: UserLogin) -> User:
+    """Проверить пару email/пароль и вернуть пользователя.
+
+    Пароль сверяется ТОЛЬКО через verify_password(введённый, сохранённый
+    хэш): соль лежит внутри сохранённой строки, и сравнивать с ней заново
+    посчитанный хэш нельзя — они разные даже для верного пароля.
+
+    Если email не найден, выполняется ровно та же по стоимости проверка,
+    но против заранее вычисленного dummy_hash. Смысл — не дать отличить
+    «нет такого пользователя» от «неверный пароль» по времени ответа и не
+    выдать существование адреса. Это снижение разницы, а не гарантия
+    постоянного времени: сеть, БД и загрузка машины тоже влияют на ответ.
+
+    Возвращаем ту же ошибку InvalidCredentials в обоих случаях, чтобы текст
+    ответа тоже не подсказывал, что именно не так.
+    """
+    user = session.scalars(select(User).where(User.email == str(data.email))).first()
+    if user is None:
+        # Проверяем против заглушки и всё равно отказываем.
+        verify_password(data.password, dummy_hash())
+        raise InvalidCredentials(INVALID_CREDENTIALS_MESSAGE)
+
+    if not verify_password(data.password, user.hashed_password):
+        raise InvalidCredentials(INVALID_CREDENTIALS_MESSAGE)
+
     return user

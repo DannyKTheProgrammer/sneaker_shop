@@ -1,0 +1,108 @@
+# Пароли: хэширование и проверка (M3).
+#
+# Здесь только криптография пароля — без HTTP, без БД и без моделей.
+# Так этот модуль можно использовать и в регистрации, и во входе, и в
+# служебных скриптах, не подтягивая за собой сервисы.
+#
+# Про соль. bcrypt сам генерирует случайную соль и хранит её внутри строки
+# хэша (формат $2b$12$<соль><хеш>). Поэтому два хэша ОДНОГО пароля всегда
+# разные, и сравнивать вычисленный хэш с сохранённой строкой бессмысленно —
+# сравнение совпадёт только случайно. Правильный способ один:
+# verify_password(введённый_пароль, сохранённый_хэш) — passlib сам достанет
+# соль из сохранённой строки и повторит вычисление.
+
+from functools import lru_cache
+
+from passlib.context import CryptContext
+
+# bcrypt__rounds=12 — стоимость (2^12 итераций), фиксируем явно, чтобы она
+# не «поехала» от обновления библиотеки.
+# bcrypt__truncate_error=True — при пароле длиннее 72 байт passlib поднимет
+# ошибку, а не обрежет пароль молча.
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    bcrypt__rounds=12,
+    bcrypt__truncate_error=True,
+)
+
+# Ограничения bcrypt: используется только первый 71 байт + NUL-терминатор,
+# то есть 72 байта — предел. Для UTF-8 это не равно 72 символам: кириллица
+# занимает 2 байта на символ.
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_BYTES = 72
+
+
+class PasswordTooLong(ValueError):
+    """Пароль длиннее предела bcrypt — хэшировать нельзя."""
+
+
+class PasswordContainsNul(ValueError):
+    """В пароле есть NUL-байт: строка оборвалась бы на нём."""
+
+
+def validate_password(password: str) -> str:
+    """Проверить пароль ДО хэширования и вернуть его же.
+
+    Проверки те же, что в схеме регистрации, и держатся здесь, чтобы
+    «отклонить до хэширования» нельзя было обойти, вызвав hash_password
+    напрямую из скрипта или будущего кода: тихого усечения быть не должно.
+    """
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"password must be at least {PASSWORD_MIN_LENGTH} characters")
+    if len(password.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise PasswordTooLong(
+            f"password must be at most {PASSWORD_MAX_BYTES} bytes in UTF-8 "
+            "(bcrypt uses only the first 72 bytes)"
+        )
+    if "\x00" in password:
+        raise PasswordContainsNul("password must not contain NUL characters")
+    return password
+
+
+def hash_password(password: str) -> str:
+    """Хэш пароля (bcrypt со случайной солью).
+
+    Открытый пароль никуда не сохраняется и не логируется: функция
+    возвращает только строку хэша.
+    """
+    return pwd_context.hash(validate_password(password))
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Проверить пароль против сохранённого хэша.
+
+    Именно так и только так: соль берётся из password_hash. Сравнивать
+    заново вычисленный хэш со строкой нельзя — соль random, строки разные.
+
+    При неверном пароле или битом хэше возвращает False, а не исключение:
+    решение «что делать с False» принимает вызывающий код.
+    """
+    if not password or not password_hash:
+        return False
+    try:
+        return pwd_context.verify(password, password_hash)
+    except ValueError:
+        # Битая строка хэша или несовместимый формат: это не «пароль верный».
+        return False
+
+
+@lru_cache(maxsize=1)
+def _dummy_hash() -> str:
+    """Хэш-заглушка для несуществующих пользователей.
+
+    Вычисляется один раз (при первом обращении) из вымышленного локального
+    пароля. Нужен при входе: если email не найден, мы всё равно выполняем
+    ту же по стоимости проверку пароля против заглушки, чтобы «нет такого
+    email» и «неверный пароль» обрабатывались одинаково и не различались
+    по времени ответа сколько-нибудь заметно.
+
+    Это снижение наблюдаемой разницы, а не гарантия постоянного времени:
+    на время ответа влияют сеть, БД и загрузка машины. Обещать идеальный
+    constant-time здесь нельзя.
+    """
+    return pwd_context.hash("dummy-password-not-used-anywhere")
+
+
+def dummy_hash() -> str:
+    """Публичный доступ к хэшу-заглушке (нужен сервису входа)."""
+    return _dummy_hash()

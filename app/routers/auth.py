@@ -1,8 +1,8 @@
-# Маршруты аутентификации (M3, часть 1: только регистрация).
+# Маршруты аутентификации (M3: регистрация и вход).
 #
-# Входа (login), выдачи JWT и маршрутов назначения администратора здесь
-# нет: регистрация создаёт обычного пользователя (is_admin=False), а
-# админские маршруты каталога появятся вместе с require_admin.
+# Выдачи JWT здесь пока нет — вход подтверждает пару email/пароль и
+# возвращает пользователя с access_token=null. Админские маршруты каталога
+# появятся вместе с require_admin на следующем шаге.
 
 from typing import Annotated
 
@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_session
-from app.schemas.auth import UserRead, UserRegister
+from app.schemas.auth import TokenResponse, UserLogin, UserRead, UserRegister
 from app.services import auth as auth_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -48,3 +48,36 @@ def register(payload: UserRegister, session: SessionDep) -> UserRead:
             status_code=status.HTTP_409_CONFLICT,
             detail="Email already registered",
         ) from exc
+
+
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    summary="Вход по email и паролю",
+    responses={
+        401: {"description": "Неверная пара email/пароль"},
+        422: {"description": "Невалидные данные или лишние поля"},
+    },
+)
+def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
+    """Проверить пару email/пароль.
+
+    Пароль сверяется с сохранённым хэшем через `verify_password` (соль
+    внутри хэша, поэтому повторное вычисление и сравнение строк не
+    используется). Если email не найден, выполняется такая же проверка
+    против dummy_hash, и ответ тот же самый — 401 без подробностей: по
+    ответу нельзя понять, существует ли такой адрес.
+
+    Токена пока нет: `access_token` = null, `token_type` = "none". JWT —
+    следующий шаг; выдумывать несуществующий токен не будем.
+    """
+    try:
+        user = auth_service.authenticate_user(session, payload)
+    except auth_service.InvalidCredentials as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    return TokenResponse(access_token=None, token_type="none", user=UserRead.model_validate(user))
