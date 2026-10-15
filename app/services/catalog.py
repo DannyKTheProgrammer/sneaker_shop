@@ -1,5 +1,4 @@
-# Чтение каталога из БД (M2 + фильтры M3). Только SELECT: ни вставок,
-# ни изменений.
+# Чтение и запись каталога в БД (M2 + запись M3).
 #
 # Здесь сознательно нет ни FastAPI, ни HTTP-ошибок: сервис отвечает на
 # вопрос «что лежит в БД», а решение «404/422/409» принимает роутер.
@@ -9,9 +8,27 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import Select, and_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import Brand, Product, ProductSize
+from app.schemas.catalog import ProductWrite
+
+
+class CatalogError(Exception):
+    """Ошибка каталога, которую вызывающий код переводит в HTTP-ответ."""
+
+
+class BrandNotFound(CatalogError):
+    """Бренда с таким id нет: ссылаться не на что."""
+
+
+class ProductNotFound(CatalogError):
+    """Товара с таким id нет (или он исчез между проверкой и записью)."""
+
+
+class CatalogConflict(CatalogError):
+    """Конфликт целостности: гонка или ограничение, которое не прошло."""
 
 
 @dataclass(slots=True)
@@ -123,3 +140,107 @@ def get_product(session: Session, product_id: int) -> Product | None:
         .where(Product.id == product_id)
     )
     return session.scalars(stmt).first()
+
+
+# --- запись каталога (M3) -------------------------------------------------
+#
+# Владелец транзакции здесь один — этот сервис: он делает и commit, и
+# rollback. Роутер (когда появится в M3 вместе с require_admin) только
+# переводит исключения в HTTP-коды и не коммитит: два владельца коммита в
+# одном запросе — верный способ закоммитить половину работы.
+#
+# Почему НЕ `with session.begin()`: сессия приходит из зависимости
+# get_session, и к моменту вызова она уже может быть в транзакции —
+# SQLAlchemy 2.0 начинает её автоматически (autobegin) при первом
+# обращении к БД. Повторный session.begin() в этом состоянии даёт
+# InvalidRequestError. Поэтому обычный порядок: проверили → изменили →
+# flush/commit, а при ошибке — rollback.
+
+
+def _brand_exists(session: Session, brand_id: int) -> bool:
+    """Есть ли бренд с таким id (ссылаться можно только на существующий)."""
+    return session.get(Brand, brand_id) is not None
+
+
+def _commit(session: Session, conflict_message: str) -> None:
+    """Зафиксировать транзакцию, а IntegrityError превратить в конфликт.
+
+    Ловим именно IntegrityError: это ожидаемая категория (гонка с
+    параллельным изменением, ограничение целостности). Любые другие
+    исключения не маскируются — они означают ошибку в коде, и пусть
+    всплывают как 500, а не превращаются в «конфликт».
+    """
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise CatalogConflict(conflict_message) from exc
+
+
+def create_product(session: Session, data: ProductWrite) -> Product:
+    """Создать карточку товара по валидированным данным.
+
+    Порядок: проверить бренд → вставить → commit → вернуть карточку с
+    размерами. Бренд проверяется ДО вставки, чтобы получить понятное
+    «нет бренда» (иначе получили бы ошибку внешнего ключа).
+
+    Размеры здесь не создаются: их источник — seed, и этот контракт их не
+    редактирует. Поэтому у нового товара sizes пустой список.
+    """
+    if not _brand_exists(session, data.brand_id):
+        raise BrandNotFound(f"brand {data.brand_id} does not exist")
+
+    values = data.writable_values()
+    product = Product(
+        name=values["name"],
+        brand_id=values["brand_id"],
+        price=values["price"],
+        description=values["description"],
+        # image_url в ProductWrite уже строка (HttpUrl -> str), в колонке Text.
+        image_url=values["image_url"],
+    )
+    session.add(product)
+    _commit(session, "product could not be created: integrity conflict")
+
+    # Перечитываем с размерами: после commit объект просрочен, а sizes
+    # нужны для ответа — ленивая загрузка здесь была бы лишним запросом
+    # (или ошибкой, если сессия уже закрыта).
+    created = get_product(session, product.id)
+    if created is None:  # pragma: no cover - сразу после commit строки быть не может
+        raise ProductNotFound("product disappeared right after creation")
+    return created
+
+
+def update_product(session: Session, product_id: int, data: ProductWrite) -> Product:
+    """Заменить редактируемые поля карточки (полный контракт, не PATCH).
+
+    Обязательные name/brand_id/price и defaults у description/image_url уже
+    обеспечены ProductWrite: пропущенные description и image_url приходят
+    как '' и null, то есть PUT действительно ЗАМЕНЯЕТ представление, а не
+    обновляет часть полей.
+
+    sizes не редактируются и не удаляются: строки product_sizes живут
+    отдельно, здесь по ним не выполняется ни одного оператора.
+    """
+    product = get_product(session, product_id)
+    if product is None:
+        raise ProductNotFound(f"product {product_id} does not exist")
+
+    if not _brand_exists(session, data.brand_id):
+        # Полный PUT обязан оставить карточку валидной: с несуществующим
+        # брендом её сохранять нельзя, поэтому отказ, а не частичная запись.
+        raise BrandNotFound(f"brand {data.brand_id} does not exist")
+
+    values = data.writable_values()
+    product.name = values["name"]
+    product.brand_id = values["brand_id"]
+    product.price = values["price"]
+    product.description = values["description"]
+    product.image_url = values["image_url"]
+
+    _commit(session, "product could not be updated: integrity conflict")
+
+    updated = get_product(session, product_id)
+    if updated is None:  # pragma: no cover - строку никто не удалял
+        raise ProductNotFound(f"product {product_id} disappeared during update")
+    return updated

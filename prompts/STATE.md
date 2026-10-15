@@ -5,8 +5,9 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 1
-(контракт записи `ProductWrite`); HTTP-запись ждёт `require_admin`.
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 3
+(сервисы записи `create_product`/`update_product`); HTTP-запись ждёт
+`require_admin`.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -66,7 +67,8 @@ app/database.py         один Engine, фабрика Session, ping() с SELEC
 app/main.py             FastAPI + GET /health + lifespan; подключает роутер каталога
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
-app/services/catalog.py чтение из БД: ProductFilters, list_brands, list_products (фильтры + limit/offset), get_product
+app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
+                        create_product, update_product (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
@@ -80,7 +82,8 @@ prompts/                тексты заданий модулей + этот ф
 `_seed_acceptance.ps1`, `_models_probe.py`, `_orders_probe.py`,
 `_schema_probe.py`, `_lifespan_probe.py`, `_acceptance_probe.ps1`,
 `_catalog_acceptance.ps1`, `_logging.json`, `_product_write_probe.py`,
-`check_env.py`, `sql/`.
+`_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
+`_write_service_probe.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -145,6 +148,9 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 # 5) фильтры и пагинация GET /products (API запущен отдельно на --port 8001)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _catalog_filters_probe.py --port 8001 --database sneaker_shop
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _filters_empty_db_probe.py   # пустой каталог + 422
+
+# 6) сервисы записи create_product/update_product (создаёт и удаляет СВОЮ временную БД)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _write_service_probe.py
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -200,6 +206,15 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   превращает строку из одних пробелов в `None`, а Pydantic отверг бы
   собственный результат, если объявить поле просто `str` (было 422 вместо
   «фильтр не задан»).
+* **Владелец транзакции один — сервис.** `create_product`/`update_product`
+  сами делают `commit` и `rollback`; роутер не коммитит. `with
+  session.begin()` использовать нельзя: зависимость уже открыла транзакцию
+  (autobegin), и повторный `begin()` даёт `InvalidRequestError`. Проверено:
+  `s.in_transaction()` → False, после первого запроса → True, `commit()`
+  без `begin()` работает.
+* **Маскировать исключения нельзя.** В `_commit` ловится только
+  `IntegrityError` → `CatalogConflict`; `RuntimeError` и прочие всплывают
+  как есть (проверено отдельным тестом).
 * **Приёмочные прогоны не должны зависеть от занятости порта**: ученик
   может держать своё приложение на 8000, поэтому вспомогательные серверы
   для приёмки поднимаются на 8001.
@@ -250,16 +265,27 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   `ILIKE '%' || :name || '%' ESCAPE '/'`. `_filters_empty_db_probe.py`:
   на пустом каталоге все фильтры дают `[]`, 422 те же, данные
   восстановлены после `rollback`.
+* M3 (часть 3, сервисы записи): `_write_service_probe.py` → все проверки
+  пройдены в отдельной временной БД. `create_product`: новый `id=31`
+  (свободен после seed), `name` с обрезкой пробелов, `price` точно
+  `12345.67`, `description=''`, `image_url` строкой, `sizes=[]`,
+  `created_at` заполнен сервером. `update_product(10, ...)`: поля заменены,
+  пропущенные `description`/`image_url` сброшены к `''`/`null` (PUT — не
+  PATCH), размеры `[(101,42.0,3),(102,43.0,0)]` не тронуты, `created_at`
+  сохранён. Отказы: `BrandNotFound` без создания/изменения товара,
+  `ProductNotFound` для PUT несуществующего, FK-конфликт → `IntegrityError`
+  → `CatalogConflict`, `RuntimeError` не замаскирован. Смена цены товара
+  не изменила `price_at_purchase=999.00` старой позиции заказа.
 
 ## Чего ещё нет
 
 * Записи в каталог по HTTP: маршруты POST/PUT/PATCH/DELETE не
-  зарегистрированы до `require_admin` (M3, часть 2). `ProductWrite` готов и
-  проверен отдельно от HTTP.
+  зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
+  `create_product`/`update_product` готовы и проверены вне HTTP.
 * `passlib[bcrypt]`, `python-jose`, хеширование паролей, выдача JWT,
   `require_admin`, регистрация и вход — не установлены и не написаны.
-* Обработки «`brand_id` не существует» → 409: контракт это пропускает
-  (схема не ходит в БД), проверять будет сервис в M3, часть 2.
+* HTTP-проверки записи (POST 201, PUT 200, 409 на бренд, 404 на товар) —
+  ожидаемые, но не выполненные: маршрутов пока нет.
 * Фильтра по цене «в диапазоне» через отдельный параметр нет — есть два
   (`min_price`/`max_price`), как в задании.
 * Постраничности с `total` нет намеренно: массивы без обёртки. Состав
@@ -272,10 +298,10 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 3: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
+M3, часть 4: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
 PyPI — из песочницы агента его нет, ставить вручную), сделать
 хеширование пароля, регистрацию и вход, JWT и зависимость `require_admin`,
-затем зарегистрировать POST/PUT/DELETE каталога только для админа, с
-проверкой существования бренда (нет бренда → 409) и товара (нет товара при
-PUT → 404). `ProductWrite` для этого уже готов. Дальше — корзина,
-оформление заказа с транзакцией и контролем остатка.
+затем зарегистрировать POST/PUT/DELETE каталога только для админа (POST →
+201, PUT → 200) и перевести `BrandNotFound` → 409, `ProductNotFound` → 404,
+`CatalogConflict` → 409. Сервисы и `ProductWrite` для этого уже готовы.
+Дальше — корзина, оформление заказа с транзакцией и контролем остатка.
