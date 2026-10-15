@@ -2,8 +2,11 @@
 #
 # M0.2: только проверка доступности БД (GET /health).
 # M2:   добавлено чтение каталога — GET /brands, GET /products,
-#       GET /products/{id}. Только чтение: POST/PUT/PATCH/DELETE не
-#       регистрируются до появления require_admin в M3.
+#       GET /products/{id}. Только чтение: POST/PUT/PATCH/DELETE каталога
+#       не регистрируются до появления require_admin в M3.
+# M3:   добавлена регистрация — POST /auth/register. Пароль наружу не
+#       возвращается, а в ошибках валидации его значение маскируется
+#       обработчиком ниже.
 # Ни create_all, ни таблиц здесь нет: схему создают миграции Alembic.
 #
 # Замечание по эксплуатации: логи и сообщения этого модуля на русском,
@@ -15,13 +18,31 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import engine, ping
+from app.routers.auth import router as auth_router
 from app.routers.catalog import router as catalog_router
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_validation_errors(errors: list[dict]) -> list[dict]:
+    """Убрать из ошибок валидации значения запроса.
+
+    Pydantic кладёт в ошибку само значение поля ('input') и контекст
+    ('ctx'). Для пароля это означало бы вернуть клиенту его же пароль в
+    открытом виде — в том числе когда пароль не подошёл (422). Оставляем
+    только type/loc/msg/url: клиенту этого достаточно, чтобы понять, что
+    именно он прислал не так, а секрет не покидает процесс.
+    """
+    return [
+        {key: value for key, value in error.items() if key not in ("input", "ctx")}
+        for error in errors
+    ]
 
 
 @asynccontextmanager
@@ -44,15 +65,29 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Sneaker Shop API (practice)",
-    version="0.2.0",
+    version="0.3.0",
     description=(
-        "Учебный бэкенд магазина кроссовок. Текущий шаг: проверка доступности БД "
-        "и чтение каталога (бренды, товары, размеры)."
+        "Учебный бэкенд магазина кроссовок. Текущий шаг: доступность БД, "
+        "чтение каталога (бренды, товары, размеры) и регистрация пользователя."
     ),
     lifespan=lifespan,
 )
 
 app.include_router(catalog_router)
+app.include_router(auth_router)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Тот же 422, но без значений полей в теле ответа.
+
+    Нужен из-за регистрации: без маскировки неверный пароль вернулся бы
+    клиенту в поле input. Подробности — в _redact_validation_errors.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _redact_validation_errors(exc.errors())},
+    )
 
 
 @app.get(

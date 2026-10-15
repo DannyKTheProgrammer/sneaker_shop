@@ -5,8 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 4
-(сервис `delete_product`); HTTP-запись ждёт `require_admin`.
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 5
+(регистрация `POST /auth/register`); дальше — вход/JWT и `require_admin`.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -63,13 +63,18 @@ alembic/env.py          URL берётся из Config.set_main_option, инач
 alembic/versions/201c8afcccba_initial.py   единственная ревизия: семь таблиц
 app/core/config.py      load_dotenv(override=False) + Settings.database_url (обязателен)
 app/database.py         один Engine, фабрика Session, ping() с SELECT 1
-app/main.py             FastAPI + GET /health + lifespan; подключает роутер каталога
+app/main.py             FastAPI + GET /health + lifespan; подключает роутеры каталога и auth,
+                        плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
+app/schemas/auth.py     UserRegister (email+password, extra=forbid) и UserRead (id/email/is_admin)
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
                         create_product, update_product, delete_product
                         (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict/ProductDeletedConflict)
+app/services/auth.py    CryptContext(bcrypt, rounds=12, truncate_error), hash_password, verify_password,
+                        register_user (+ EmailAlreadyRegistered), разбор IntegrityError 23505
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
+app/routers/auth.py     POST /auth/register (201/409/422)
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
 app/models/__init__.py  экспорт Base и семи моделей
@@ -84,7 +89,7 @@ prompts/                тексты заданий модулей + этот ф
 `_catalog_acceptance.ps1`, `_logging.json`, `_product_write_probe.py`,
 `_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
 `_write_service_probe.py`, `_delete_service_probe.py`,
-`_m2_contract_review.py`, `check_env.py`, `sql/`.
+`_m2_contract_review.py`, `_auth_register_probe.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -159,6 +164,9 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 # 8) независимое ревью контракта M2 (все чтения, фильтры, 404/409/422,
 #    фикстур: товар с тремя размерами, stock=0, буквальные % и _)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _m2_contract_review.py --port 8001 --database <имя>
+
+# 9) регистрация POST /auth/register (API на 8001, своя временная БД)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _auth_register_probe.py --port 8001 --database <имя>
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -307,6 +315,19 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   (`schemas/catalog.py`, `schemas/query.py`), обновлён устаревший заголовок
   `routers/catalog.py`. После правок все три набора (ревью, фильтры, запись)
   перезапущены — `ALL CHECKS PASSED`.
+* M3 (часть 5, регистрация): `_auth_register_probe.py` → все проверки
+  пройдены. `POST /auth/register` → 201, ответ только
+  `{id, email, is_admin=false}`; email нормализуется strip+lower и в ответе,
+  и в БД; в БД хэш `$2b$12$...`, открытого пароля нет, `verify_password`
+  проходит и на неверном пароле даёт False; занятый email (тот же, другой
+  регистр, пробелы) → 409 и второй пользователь не создаётся; 12 наборов
+  невалидных данных → 422 (включая `is_admin=true`, `id`,
+  `hashed_password`, 73 символа, 40 кириллических символов = 80 байт, NUL);
+  **пароль не появляется в теле 422**, ошибки содержат только
+  type/loc/msg; неудачные попытки не создают строк; повторная регистрация
+  того же нормализованного email на уровне сервиса → `EmailAlreadyRegistered`
+  (UNIQUE в БД, а не предварительный SELECT); маршрута login и назначения
+  администратора нет. Регрессия M2 после этого прогнана — `ALL CHECKS PASSED`.
 
 ## Чего ещё нет
 
@@ -314,8 +335,10 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
   `create_product`/`update_product`/`delete_product` готовы и проверены
   вне HTTP.
-* `passlib[bcrypt]`, `python-jose`, хеширование паролей, выдача JWT,
-  `require_admin`, регистрация и вход — не установлены и не написаны.
+* Входа (login) и выдачи JWT нет: есть только регистрация. Публичного
+  маршрута назначения администратора нет и не планируется — `is_admin`
+  выставляется явно в `False`.
+* `python-jose` установлен (3.5.0), но нигде не используется.
 * HTTP-проверки записи (POST 201, PUT 200, DELETE 204/404/409) —
   ожидаемые, но не выполненные: маршрутов пока нет.
 * **Открытый пункт приёмки M3:** подключить запись через `require_admin` и
@@ -338,12 +361,12 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 5: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
-PyPI — из песочницы агента его нет, ставить вручную), сделать
-хеширование пароля, регистрацию и вход, JWT и зависимость `require_admin`,
-затем зарегистрировать POST/PUT/DELETE каталога только для админа
-(POST → 201, PUT → 200, DELETE → 204 с пустым телом, повторный DELETE →
-404) и перевести `BrandNotFound` → 409, `ProductNotFound` → 404,
-`CatalogConflict`/`ProductDeletedConflict` → 409. Сервисы, `ProductWrite`
-и `delete_product` для этого уже готовы.
+M3, часть 6: вход (`POST /auth/login`), выдача JWT через `python-jose`
+(3.5.0 уже установлен), зависимость `require_admin`, затем регистрация
+POST/PUT/DELETE каталога только для админа (POST → 201, PUT → 200,
+DELETE → 204 с пустым телом, повторный DELETE → 404) и перевод ошибок
+сервисов: `BrandNotFound` → 409, `ProductNotFound` → 404,
+`CatalogConflict`/`ProductDeletedConflict` → 409. Затем закрыть открытый
+пункт приёмки: POST/PUT/DELETE без токена, с неверным токеном, обычным
+пользователем и администратором.
 Дальше — корзина, оформление заказа с транзакцией и контролем остатка.
