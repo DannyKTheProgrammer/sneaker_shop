@@ -5,9 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 3
-(сервисы записи `create_product`/`update_product`); HTTP-запись ждёт
-`require_admin`.
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 4
+(сервис `delete_product`); HTTP-запись ждёт `require_admin`.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -68,7 +67,8 @@ app/main.py             FastAPI + GET /health + lifespan; подключает �
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
-                        create_product, update_product (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict)
+                        create_product, update_product, delete_product
+                        (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict/ProductDeletedConflict)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
@@ -151,6 +151,9 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 6) сервисы записи create_product/update_product (создаёт и удаляет СВОЮ временную БД)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _write_service_probe.py
+
+# 7) удаление товара delete_product (своя временная БД, заказ и корзина как ссылки)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _delete_service_probe.py
 ```
 
 Ожидаемые результаты: `_review_m01_probe.py --phase setup` → `ALL SETUP
@@ -276,15 +279,26 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   `ProductNotFound` для PUT несуществующего, FK-конфликт → `IntegrityError`
   → `CatalogConflict`, `RuntimeError` не замаскирован. Смена цены товара
   не изменила `price_at_purchase=999.00` старой позиции заказа.
+* M3 (часть 4, удаление): `_delete_service_probe.py` → все проверки
+  пройдены в отдельной временной БД. Товар 10 с заказом на размер 101 —
+  `ProductDeletedConflict`, товар, оба размера, позиция заказа и её
+  `price_at_purchase` целы. Товар 20 со ссылкой ТОЛЬКО из корзины — тоже
+  отказ, строка корзины не тронута. Гонка (ссылка появилась после
+  проверки) → `IntegrityError` → `ProductDeletedConflict`, полный откат,
+  сессия рабочая. После снятия ссылок товар 10 удалён вместе с размерами
+  101/102, чужие размеры (201, 301) и корзина не тронуты, повторное
+  удаление → `ProductNotFound`. FK в схеме остались те же 7, `ON DELETE
+  CASCADE` нигде нет.
 
 ## Чего ещё нет
 
-* Записи в каталог по HTTP: маршруты POST/PUT/PATCH/DELETE не
+* Записи в каталог по HTTP: маршруты POST/PUT/DELETE не
   зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
-  `create_product`/`update_product` готовы и проверены вне HTTP.
+  `create_product`/`update_product`/`delete_product` готовы и проверены
+  вне HTTP.
 * `passlib[bcrypt]`, `python-jose`, хеширование паролей, выдача JWT,
   `require_admin`, регистрация и вход — не установлены и не написаны.
-* HTTP-проверки записи (POST 201, PUT 200, 409 на бренд, 404 на товар) —
+* HTTP-проверки записи (POST 201, PUT 200, DELETE 204/404/409) —
   ожидаемые, но не выполненные: маршрутов пока нет.
 * Фильтра по цене «в диапазоне» через отдельный параметр нет — есть два
   (`min_price`/`max_price`), как в задании.
@@ -298,10 +312,12 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 4: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
+M3, часть 5: поставить `passlib[bcrypt]` и `python-jose` (нужен доступ к
 PyPI — из песочницы агента его нет, ставить вручную), сделать
 хеширование пароля, регистрацию и вход, JWT и зависимость `require_admin`,
-затем зарегистрировать POST/PUT/DELETE каталога только для админа (POST →
-201, PUT → 200) и перевести `BrandNotFound` → 409, `ProductNotFound` → 404,
-`CatalogConflict` → 409. Сервисы и `ProductWrite` для этого уже готовы.
+затем зарегистрировать POST/PUT/DELETE каталога только для админа
+(POST → 201, PUT → 200, DELETE → 204 с пустым телом, повторный DELETE →
+404) и перевести `BrandNotFound` → 409, `ProductNotFound` → 404,
+`CatalogConflict`/`ProductDeletedConflict` → 409. Сервисы, `ProductWrite`
+и `delete_product` для этого уже готовы.
 Дальше — корзина, оформление заказа с транзакцией и контролем остатка.

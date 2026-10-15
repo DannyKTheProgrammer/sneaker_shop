@@ -7,11 +7,11 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import Select, and_, select
+from sqlalchemy import Select, and_, delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import Brand, Product, ProductSize
+from app.models import Brand, CartItem, OrderItem, Product, ProductSize
 from app.schemas.catalog import ProductWrite
 
 
@@ -29,6 +29,14 @@ class ProductNotFound(CatalogError):
 
 class CatalogConflict(CatalogError):
     """Конфликт целостности: гонка или ограничение, которое не прошло."""
+
+
+class ProductDeletedConflict(CatalogConflict):
+    """Товар нельзя удалить: на его размеры ссылаются корзина или заказы.
+
+    Отдельный класс, чтобы HTTP-слой мог отличить «удалять нечего» (404)
+    от «удалять нельзя» (409) и, при желании, назвать причину в ответе.
+    """
 
 
 @dataclass(slots=True)
@@ -244,3 +252,74 @@ def update_product(session: Session, product_id: int, data: ProductWrite) -> Pro
     if updated is None:  # pragma: no cover - строку никто не удалял
         raise ProductNotFound(f"product {product_id} disappeared during update")
     return updated
+
+
+def _size_ids(session: Session, product_id: int) -> list[int]:
+    """id всех размеров товара.
+
+    Нужны, чтобы проверить ссылки из корзины и заказов: и cart_items, и
+    order_items ссылаются на product_sizes.id, а не на products.id.
+    """
+    return list(session.scalars(select(ProductSize.id).where(ProductSize.product_id == product_id)))
+
+
+def _references(session: Session, size_ids: list[int]) -> list[str]:
+    """Какие таблицы ссылаются на размеры товара.
+
+    Возвращает человекочитаемые имена таблиц. Пустой список = ссылок нет.
+    """
+    if not size_ids:
+        return []
+    referenced = []
+    if session.scalar(select(CartItem.id).where(CartItem.product_size_id.in_(size_ids)).limit(1)) is not None:
+        referenced.append("cart_items")
+    if session.scalar(select(OrderItem.id).where(OrderItem.product_size_id.in_(size_ids)).limit(1)) is not None:
+        referenced.append("order_items")
+    return referenced
+
+
+def delete_product(session: Session, product_id: int) -> None:
+    """Удалить товар вместе с его размерами (одной транзакцией).
+
+    Правила:
+
+    * нет товара с таким id → ProductNotFound (для HTTP это 404);
+    * на любой размер товара ссылается cart_items или order_items →
+      ProductDeletedConflict, и НИЧЕГО не удаляется: ни карточка, ни
+      размеры, ни ссылки. Удалять товар из-под корзины или истории заказов
+      нельзя, поэтому отказ, а не «тихое» удаление связанных строк;
+    * ссылок нет → удаляются размеры, затем сама карточка, одним commit.
+
+    Размеры удаляем сами, потому что каскада в схеме нет намеренно:
+    ondelete у внешних ключей не задан, и история заказов не должна
+    исчезать вместе с товаром. Порядок обязателен: сначала product_sizes
+    (на них ссылаются cart_items/order_items), потом products (на него
+    ссылаются product_sizes).
+
+    Проверка ссылок и удаление сделаны явно, а IntegrityError от самого
+    DELETE остаётся страховкой от гонки: между проверкой и удалением
+    кто-то мог добавить товар в корзину. В этом случае rollback и тот же
+    осмысленный конфликт, а не 500.
+    """
+    product = session.get(Product, product_id)
+    if product is None:
+        raise ProductNotFound(f"product {product_id} does not exist")
+
+    size_ids = _size_ids(session, product_id)
+    referenced = _references(session, size_ids)
+    if referenced:
+        raise ProductDeletedConflict(
+            f"product {product_id} is referenced by {', '.join(referenced)}"
+        )
+
+    try:
+        if size_ids:
+            session.execute(delete(ProductSize).where(ProductSize.product_id == product_id))
+        session.execute(delete(Product).where(Product.id == product_id))
+        session.commit()
+    except IntegrityError as exc:
+        # Ссылку добавили параллельно после проверки: откатываем всё.
+        session.rollback()
+        raise ProductDeletedConflict(
+            f"product {product_id} is referenced by cart_items or order_items"
+        ) from exc
