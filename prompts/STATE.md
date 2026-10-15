@@ -5,8 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 8
-(`get_current_user` и `require_admin`); дальше — запись каталога через админа.
+Обновляется после каждого значимого шага. Последнее обновление: M3 завершён —
+запись каталога подключена и проверена матрицей, M2 остаётся контрольной точкой.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -38,19 +38,25 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
   `product_sizes`, `users`, `cart_items`, `orders`, `order_items`)
   плюс служебная `alembic_version`.
 * Данные в рабочей БД: `brands=2`, `products=3`, `product_sizes=4`,
-  `users=0`, `cart_items=0`, `orders=0`, `order_items=0`.
+  а в `users` — две записи, созданные учеником через GUI
+  (`danny@gmail.com`, `admin@example.com`). Их не удалять: это не мусор
+  проверок. `cart_items=0`, `orders=0`, `order_items=0`.
 * Временных учебных БД нет (в кластере только `postgres`, `sneaker_shop`,
   `template0`, `template1`).
-* API: версия приложения `0.2.0`, маршруты **только на чтение** —
-  `GET /health`, `GET /brands`, `GET /products`, `GET /products/{id}`.
+* API: две точки входа.
+  `app.store_main:app` (он же `app.main:app`) — **результат M3**, версия
+  `0.5.0`: чтение каталога, регистрация/вход/JWT и запись каталога
+  (`POST /products`, `PUT /products/{id}`, `DELETE /products/{id}`) под
+  `require_admin`.
+  `app.catalog_main:app` — **контрольная точка M2**, версия `0.2.0`:
+  те же чтение и auth, но маршрутов записи каталога нет (405).
   У `/products` есть фильтры и пагинация: `brand_id`, `min_price`,
   `max_price`, `size`, `search`, `limit` (20, макс 100), `offset`.
-  Записи (POST/PUT/PATCH/DELETE) не регистрируются до `require_admin` в M3.
-* Порт 8000: ученик может держать на нём СВОЁ запущенное приложение
-  (наблюдалось: `python.exe` PID 16020, путь `C:\Python312\python.exe` —
-  системный Python, а не venv проекта). Это не осиротевший процесс, убивать
-  его не нужно: для приёмки либо договориться о перезапуске, либо взять
-  другой порт (`--port 8001`). Контейнер `db` запущен и healthy.
+* Порт 8000: ученик держит на нём СВОЁ приложение разработки
+  (`python -m uvicorn app.main:app --reload --port 8000`, системный Python и
+  reload-воркер). Это не осиротевший процесс, убивать его не нужно: для
+  приёмки берём другой порт (8001 — store_main, 8002 — catalog_main) и
+  СВОЮ временную БД. Контейнер `db` запущен и healthy.
 
 ## Структура проекта
 
@@ -61,6 +67,10 @@ requirements.txt        зафиксированные fastapi, uvicorn, pydanti
 alembic.ini             конфиг Alembic БЕЗ строки подключения (секретов нет)
 alembic/env.py          URL берётся из Config.set_main_option, иначе из settings
 alembic/versions/201c8afcccba_initial.py   единственная ревизия: семь таблиц
+app/app_factory.py      build_app(include_writes=...) — общая сборка: health, роутеры, обработчик 422
+app/store_main.py       app = build_app(include_writes=True)  — результат M3
+app/catalog_main.py     app = build_app(include_writes=False) — контрольная точка M2
+app/main.py             app = build_app(include_writes=True)  — совместимость с прежними командами запуска
 app/core/config.py      load_dotenv(override=False); Settings: database_url и jwt_secret (SecretStr, оба обязательны),
                         jwt_algorithm=HS256, jwt_expire_minutes=15, jwt_issuer/audience
 app/database.py         один Engine, фабрика Session, ping() с SELECT 1
@@ -79,7 +89,8 @@ app/services/catalog.py чтение и запись: ProductFilters, list_brand
 app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
                         authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email),
                         get_user_by_id (проверка токена)
-app/routers/catalog.py  HTTP-маршруты каталога (только GET)
+app/routers/catalog.py  HTTP-маршруты каталога (только GET, публичные)
+app/routers/catalog_write.py  POST/PUT/DELETE каталога; весь роутер под dependencies=[Depends(require_admin)]
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
                         HTTPBearer + get_current_user/CurrentUser и require_admin/AdminUser
@@ -99,7 +110,8 @@ prompts/                тексты заданий модулей + этот ф
 `_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
 `_write_service_probe.py`, `_delete_service_probe.py`,
 `_m2_contract_review.py`, `_auth_register_probe.py`, `_auth_login_probe.py`,
-`_jwt_probe.py`, `_auth_guard_probe.py`, `check_env.py`, `sql/`.
+`_jwt_probe.py`, `_auth_guard_probe.py`, `_write_matrix_probe.py`,
+`_m2_checkpoint_probe.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -186,6 +198,15 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 12) защита доступа: get_current_user и require_admin (матрица отказов, смена роли)
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _auth_guard_probe.py --port 8001 --database <имя>
+
+# 13) МАТРИЦА ЗАПИСИ (результат M3, store_main на 8001, СВОЯ временная БД):
+#     для POST/PUT/DELETE: без токена 401, неверный токен 401, обычный 403, админ 201/200/204,
+#     плюс 404/409/422 и проверка неизменности данных после каждого отказа.
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _write_matrix_probe.py --port 8001 --database <имя>
+
+# 14) контрольная точка M2 (catalog_main на 8002): запись даёт 405, чтение публичное
+.\sneaker_shop_.venv\Scripts\python.exe -m uvicorn app.catalog_main:app --port 8002
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _m2_checkpoint_probe.py --port 8002
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -392,6 +413,20 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   `X-Admin` и `?is_admin=true` не помогают. Смена `is_admin` в БД
   действует на уже выданный токен сразу (403 → 200 → 403 без перевыпуска),
   а `is_admin=true` в claims ничего не даёт: роль читается из БД.
+* M3 (часть 9, запись каталога): `_write_matrix_probe.py` → все проверки
+  пройдены. Для **каждого** из POST /products, PUT /products/{id},
+  DELETE /products/{id}: без токена → 401 (+ `WWW-Authenticate`), неверный
+  токен → 401, заголовок без `Bearer` → 401, обычный пользователь → 403,
+  администратор → 201/200/204. Успешный DELETE отдаёт 204 с пустым телом,
+  повторный → 404. Отдельно: PUT несуществующего → 404, неизвестный бренд
+  в POST и PUT → 409, DELETE товара со ссылкой из заказа (размер 101) → 409,
+  со ссылкой только из корзины (размер 201) → 409, цена `-1` и `10.999` и
+  лишнее поле → 422. После **каждого** отказа снимок
+  products/product_sizes/cart_items/orders/order_items не изменился.
+  PUT — полная замена (description → `''`, image_url → `null`) и размеры
+  товара не трогает. Контрольная точка M2 (`_m2_checkpoint_probe.py`,
+  catalog_main): каталог только GET, POST/PUT/DELETE/PATCH → 405, чтение
+  публичное, регистрация и вход работают.
 
 ## Чего ещё нет
 
@@ -399,17 +434,12 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
   `create_product`/`update_product`/`delete_product` готовы и проверены
   вне HTTP.
-* Вход выдаёт JWT (HS256, 15 минут), `require_admin` написан и проверен, но
-  записи каталога по HTTP всё ещё нет: POST/PUT/DELETE не подключены.
-* `/auth/admin-check` — только проверка доступа (GET). Маршрута, который
-  назначает или снимает администратора, нет и не планируется: роль
-  меняется только прямым UPDATE в БД.
-* HTTP-проверки записи каталога (POST 201, PUT 200, DELETE 204/404/409) —
-  ожидаемые, но не выполненные: маршрутов пока нет.
-* **Открытый пункт приёмки M3:** подключить запись через `require_admin` и
-  повторить POST/PUT/DELETE в четырёх режимах — без токена, с неверным
-  токеном, обычным пользователем, администратором. До этого требование
-  «CRUD только админу» принятым НЕ считается.
+* Запись каталога подключена и защищена; `require_admin` работает. Корзины,
+  оформления заказа и связи товара с заказом через API ещё нет.
+* Публичного маршрута назначения администратора нет: роль меняется только
+  прямым UPDATE в БД (для приёмки админ создаётся так же).
+* **Отложенное требование M2 закрыто** матрицей записи на результата M3
+  (часть 9). Осталось на будущие модули: корзина и оформление заказа.
 * Swagger не умеет логиниться JSON-формой: `HTTPBearer` — это только поле
   для вставки токена. Порядок: вызвать `/auth/login`, затем Authorize.
 * Постоянное время ответа входа не гарантируется: dummy_hash выравнивает
@@ -431,11 +461,11 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 9: зарегистрировать POST/PUT/DELETE каталога только для админа
-через `require_admin` (POST → 201, PUT → 200, DELETE → 204 с пустым телом,
-повторный DELETE → 404) и перевести ошибки сервисов: `BrandNotFound` → 409,
-`ProductNotFound` → 404, `CatalogConflict`/`ProductDeletedConflict` → 409.
-Затем закрыть открытый пункт приёмки: POST/PUT/DELETE без токена (401),
-с неверным токеном (401), обычным пользователем (403) и администратором
-(успех).
-Дальше — корзина, оформление заказа с транзакцией и контролем остатка.
+M3, часть 10 (по заданию ученика) — либо переход к корзине: `POST /cart`,
+`GET /cart`, изменение количества, удаление позиции; затем оформление
+заказа (`POST /orders`) одной транзакцией с контролем остатка
+(`UPDATE product_sizes SET stock = stock - :qty WHERE id = :id AND stock >= :qty`)
+и снимком цены в `order_items.price_at_purchase`.
+Напоминание: админские маршруты каталога уже защищены, поэтому при
+добавлении новых маршрутов записи их защиту нужно решать отдельно
+(корзина — это маршруты самого пользователя, не администратора).

@@ -309,9 +309,28 @@ def main() -> int:
         check("GET /products/0 -> 404", code == 404, f"{code} {body}")
         code, body, _ = call("GET", "/products/-1")
         check("GET /products/-1 -> 404", code == 404, f"{code} {body}")
+        # Ожидание зависит от точки входа: в catalog_main запись не
+        # подключена (405), в store_main маршруты есть и без токена дают 401.
+        # Проверка не отключена — сравниваем с фактическим составом OpenAPI.
+        spec_code, spec, _ = call("GET", "/openapi.json")
+        writes_connected = any(
+            method != "get"
+            for path, ops in (spec.get("paths") or {}).items() if path.startswith("/products")
+            for method in ops
+        )
+        print(f"    запись каталога подключена: {writes_connected}")
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             code, body, _ = call(method, "/products/40")
-            check(f"{method} /products/40 -> 405 (маршрут записи не подключён)", code == 405, f"{code}")
+            if writes_connected:
+                # На /products/{id} существуют PUT и DELETE, а POST — только
+                # на коллекции /products, поэтому POST по пути с id даёт 405
+                # на уровне маршрутизации (до зависимостей). Это ожидаемо.
+                expected = {"POST": 405, "PUT": 401, "DELETE": 401, "PATCH": 405}[method]
+                label = f"{method} /products/40 -> {expected} (по составу маршрутов)"
+            else:
+                expected = 405
+                label = f"{method} /products/40 -> 405 (маршрут записи не подключён)"
+            check(label, code == expected, f"{code}")
 
         from app.services import catalog as svc
 
