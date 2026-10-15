@@ -5,8 +5,8 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3, часть 7
-(выдача и проверка JWT); дальше — `require_admin` и запись каталога.
+Обновляется после каждого значимого шага. Последнее обновление: M3, часть 8
+(`get_current_user` и `require_admin`); дальше — запись каталога через админа.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -70,7 +70,8 @@ app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, Product
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
 app/core/security.py    пароли: CryptContext(bcrypt, rounds=12, truncate_error), validate_password,
                         hash_password, verify_password, dummy_hash (для входа без утечки по времени);
-                        JWT: create_access_token / decode_access_token / InvalidToken (HS256, sub/exp/iat/iss/aud)
+                        JWT: create_access_token / decode_access_token / InvalidToken (HS256, явный
+                        algorithms, обязательные exp/sub/iss/aud, sub = ASCII-цифры в диапазоне int4)
 app/schemas/auth.py     UserRegister/UserLogin (email+password, extra=forbid), UserRead, TokenResponse
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
                         create_product, update_product, delete_product
@@ -80,7 +81,8 @@ app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор In
                         get_user_by_id (проверка токена)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET)
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
-                        GET /auth/me (200/401), HTTPBearer + get_current_user/CurrentUser
+                        GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
+                        HTTPBearer + get_current_user/CurrentUser и require_admin/AdminUser
 setup_jwt.py            генерация JWT_SECRET в .env без перезаписи существующего ключа
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
@@ -97,7 +99,7 @@ prompts/                тексты заданий модулей + этот ф
 `_catalog_filters_probe.py`, `_filters_empty_db_probe.py`,
 `_write_service_probe.py`, `_delete_service_probe.py`,
 `_m2_contract_review.py`, `_auth_register_probe.py`, `_auth_login_probe.py`,
-`_jwt_probe.py`, `check_env.py`, `sql/`.
+`_jwt_probe.py`, `_auth_guard_probe.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -181,6 +183,9 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 
 # 11) JWT: выдача, срок, подпись, iss/aud, GET /auth/me, схема HTTPBearer
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _jwt_probe.py --port 8001 --database <имя>
+
+# 12) защита доступа: get_current_user и require_admin (матрица отказов, смена роли)
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _auth_guard_probe.py --port 8001 --database <имя>
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -375,6 +380,18 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   (токен на 1 с принят, через 2 с — 401) и для удалённого пользователя.
   OpenAPI: схема `HTTPBearer` (OAuth2 нет), `/auth/me` защищён. Все прежние
   наборы после обновления ожиданий — `ALL CHECKS PASSED`.
+* M3 (часть 8, защита доступа): `_auth_guard_probe.py` → все проверки
+  пройдены. `get_current_user`: 200 с валидным токеном; 401 +
+  `WWW-Authenticate: Bearer` при отсутствии заголовка, `Basic`, заголовке
+  без `Bearer`, пустом/мусорном токене, подписи чужим ключом, изменённом
+  payload, `alg=HS512`, просроченном и отсутствующем `exp`, отсутствующих
+  `sub`/`iss`/`aud`, чужом `iss`/`aud`, `sub` не числом, с плюсом,
+  пробелом, Unicode-цифрами, больше int4, отрицательном, числом вместо
+  строки, и для удалённого пользователя. `require_admin`: обычный
+  пользователь → 403, администратор → 200, без токена → 401 (не 403);
+  `X-Admin` и `?is_admin=true` не помогают. Смена `is_admin` в БД
+  действует на уже выданный токен сразу (403 → 200 → 403 без перевыпуска),
+  а `is_admin=true` в claims ничего не даёт: роль читается из БД.
 
 ## Чего ещё нет
 
@@ -382,10 +399,11 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
   `create_product`/`update_product`/`delete_product` готовы и проверены
   вне HTTP.
-* Вход выдаёт JWT (HS256, 15 минут), но `require_admin` ещё нет: админских
-  маршрутов и записи каталога по HTTP по-прежнему нет.
-* Публичного маршрута назначения администратора нет: `is_admin` выставляется
-  явно в `False` при регистрации.
+* Вход выдаёт JWT (HS256, 15 минут), `require_admin` написан и проверен, но
+  записи каталога по HTTP всё ещё нет: POST/PUT/DELETE не подключены.
+* `/auth/admin-check` — только проверка доступа (GET). Маршрута, который
+  назначает или снимает администратора, нет и не планируется: роль
+  меняется только прямым UPDATE в БД.
 * HTTP-проверки записи каталога (POST 201, PUT 200, DELETE 204/404/409) —
   ожидаемые, но не выполненные: маршрутов пока нет.
 * **Открытый пункт приёмки M3:** подключить запись через `require_admin` и
@@ -413,11 +431,11 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-M3, часть 8: зависимость `require_admin` поверх `get_current_user` и
-регистрация POST/PUT/DELETE каталога только для админа (POST → 201,
-PUT → 200, DELETE → 204 с пустым телом, повторный DELETE → 404) с переводом
-ошибок сервисов: `BrandNotFound` → 409, `ProductNotFound` → 404,
-`CatalogConflict`/`ProductDeletedConflict` → 409. Затем закрыть открытый
-пункт приёмки: POST/PUT/DELETE без токена, с неверным токеном, обычным
-пользователем и администратором (403 для обычного, успех для админа).
+M3, часть 9: зарегистрировать POST/PUT/DELETE каталога только для админа
+через `require_admin` (POST → 201, PUT → 200, DELETE → 204 с пустым телом,
+повторный DELETE → 404) и перевести ошибки сервисов: `BrandNotFound` → 409,
+`ProductNotFound` → 404, `CatalogConflict`/`ProductDeletedConflict` → 409.
+Затем закрыть открытый пункт приёмки: POST/PUT/DELETE без токена (401),
+с неверным токеном (401), обычным пользователем (403) и администратором
+(успех).
 Дальше — корзина, оформление заказа с транзакцией и контролем остатка.

@@ -129,6 +129,16 @@ class InvalidToken(Exception):
     """Токен отсутствует, просрочен, подделан или относится к другому приложению."""
 
 
+# Диапазон типа integer в PostgreSQL (int4). sub должен попадать в него,
+# иначе поиск по id либо не найдёт пользователя, либо упадёт на приведении
+# типа — и то и другое должно быть 401, а не 500.
+POSTGRES_INT_MIN = -2_147_483_648
+POSTGRES_INT_MAX = 2_147_483_647
+
+# Claims, без которых токен не считается полным.
+REQUIRED_CLAIMS = ("exp", "sub", "iss", "aud")
+
+
 def create_access_token(user_id: int, expires_delta: timedelta | None = None) -> str:
     """Подписать access token для пользователя.
 
@@ -154,25 +164,50 @@ def create_access_token(user_id: int, expires_delta: timedelta | None = None) ->
 def decode_access_token(token: str) -> int:
     """Проверить подпись и claims и вернуть id пользователя из sub.
 
-    Проверяются: подпись, exp (истечение), iss и aud. Любая проблема —
-    InvalidToken без подробностей: клиенту не нужно знать, что именно не
-    так с токеном, а разные тексты помогли бы перебирать варианты.
+    Порядок проверок и почему так:
+
+    1. Подпись. jwt.decode с явным algorithms=["HS256"] — алгоритм не
+       берётся из заголовка токена, иначе атакующий мог бы подсунуть
+       "alg": "none" или другой алгоритм. Ключ — только из настроек.
+    2. iss и aud: передаются в decode, поэтому чужой издатель или чужое
+       приложение не проходят.
+    3. exp: python-jose требует его наличия и проверяет срок; токен без exp
+       отвергается (это в REQUIRED_CLAIMS).
+    4. Обязательные claims проверяются явно по списку.
+    5. sub: строка, состоящая ТОЛЬКО из ASCII-цифр. str.isdigit() здесь не
+       годится — он пропускает Unicode-цифры вроде '١٢', которые int()
+       потом отвергнет (или, хуже, примет не так, как ожидается).
+    6. sub должен влезать в int4 PostgreSQL: слишком большое число не
+       должно превращаться в 500 при запросе к БД.
+
+    Декодированному payload не доверяем ни в чём, кроме этих проверенных
+    полей: никакой роли, email или прав оттуда не берётся — за ними
+    обращаемся в БД.
     """
     try:
         claims = jwt.decode(
             token,
             settings.jwt_secret.get_secret_value(),
-            algorithms=[settings.jwt_algorithm],
+            algorithms=[settings.jwt_algorithm],   # явный список, не из токена
             audience=settings.jwt_audience,
             issuer=settings.jwt_issuer,
         )
     except JWTError as exc:
+        # Сюда попадают: битая подпись, истёкший exp, отсутствующий exp,
+        # чужой iss/aud, неразбираемый токен.
         raise InvalidToken("access token is invalid or expired") from exc
 
-    subject = claims.get("sub")
-    if subject is None:
-        raise InvalidToken("access token has no subject")
-    try:
-        return int(subject)
-    except (TypeError, ValueError) as exc:
-        raise InvalidToken("access token subject is not a user id") from exc
+    missing = [claim for claim in REQUIRED_CLAIMS if claims.get(claim) in (None, "")]
+    if missing:
+        raise InvalidToken(f"access token misses required claims: {', '.join(missing)}")
+
+    subject = claims["sub"]
+    if not isinstance(subject, str) or not subject.isascii() or not subject.isdigit():
+        # isascii + isdigit: только '0'-'9', без знаков, пробелов и
+        # Unicode-цифр.
+        raise InvalidToken("access token subject is not a numeric user id")
+
+    user_id = int(subject)
+    if not (POSTGRES_INT_MIN <= user_id <= POSTGRES_INT_MAX):
+        raise InvalidToken("access token subject is out of range for a user id")
+    return user_id

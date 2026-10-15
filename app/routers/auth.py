@@ -44,9 +44,22 @@ def get_current_user(
 ) -> User:
     """Пользователь из access token.
 
-    Проверяется подпись, срок действия, издатель и аудитория — всё в
-    decode_access_token. Затем пользователь перечитывается из БД: если его
-    удалили, токен перестаёт работать, хотя подпись ещё валидна.
+    Шаги:
+
+    1. Заголовок `Authorization: Bearer <token>` разбирает HTTPBearer с
+       auto_error=False. Нет заголовка или он не Bearer → 401 от нас (а не
+       встроенный 403), всегда с WWW-Authenticate: Bearer.
+    2. Подпись, срок, iss, aud и формат sub проверяет
+       core.security.decode_access_token. Декодированному payload мы не
+       доверяем: из него берётся ТОЛЬКО id пользователя.
+    3. Пользователь читается из БД по этому id. Возвращается настоящая
+       строка User, а не то, что написано в токене: роль, email и факт
+       существования берутся из базы и потому не могут быть подделаны
+       содержимым токена. Нет строки → 401 (токен подписан нами, но
+       пользователь удалён).
+
+    Побочный эффект, который нам и нужен: изменение роли в БД действует
+    на следующем же запросе с уже выданным токеном — перевыпуск не нужен.
     """
     if credentials is None or not credentials.credentials:
         raise _unauthorized("Not authenticated")
@@ -57,12 +70,33 @@ def get_current_user(
 
     user = auth_service.get_user_by_id(session, user_id)
     if user is None:
-        # Токен подписан нами, но пользователя больше нет.
         raise _unauthorized()
     return user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def require_admin(current_user: CurrentUser) -> User:
+    """Пропустить только администратора (иначе 403).
+
+    Роль берётся из строки пользователя, прочитанной из БД на этом же
+    запросе, а не из claims токена: иначе достаточно было бы один раз
+    получить админский токен или подделать claim, чтобы права остались
+    навсегда. Здесь же снятие роли действует сразу.
+
+    Проверяется строго `is True`: если колонка когда-нибудь окажется NULL
+    (схема разошлась с ожиданием), доступ всё равно будет закрыт.
+    """
+    if current_user.is_admin is not True:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+    return current_user
+
+
+AdminUser = Annotated[User, Depends(require_admin)]
 
 
 @router.post(
@@ -148,9 +182,32 @@ def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
 def read_me(current_user: CurrentUser) -> UserRead:
     """Вернуть пользователя, которому принадлежит предъявленный токен.
 
-    Маршрут существует как рабочая проверка защищённого доступа: он
-    отвечает 200 только с валидным токеном и 401 во всех остальных
-    случаях (нет заголовка, битая подпись, истёк срок, удалённый
-    пользователь). Он же демонстрирует схему HTTPBearer в OpenAPI.
+    Ответ — UserRead: id, email, is_admin. Пароля и хэша здесь нет ни в
+    каком виде.
+
+    Маршрут существует как рабочая проверка защищённого доступа: 200 только
+    с валидным токеном, 401 во всех остальных случаях (нет заголовка,
+    битая подпись, истёк срок, чужой aud, удалённый пользователь). Он же
+    демонстрирует схему HTTPBearer в OpenAPI.
     """
     return current_user
+
+
+@router.get(
+    "/admin-check",
+    response_model=UserRead,
+    summary="Проверка require_admin (только администратор)",
+    responses={
+        401: {"description": "Токен отсутствует или недействителен"},
+        403: {"description": "Пользователь не администратор"},
+    },
+)
+def admin_check(admin: AdminUser) -> UserRead:
+    """Эндпоинт-проверка зависимости require_admin.
+
+    Нужен, чтобы приёмка M3 могла убедиться: обычный пользователь получает
+    403, администратор — 200, а смена роли в БД действует на следующем
+    запросе с уже выданным токеном. Это только проверка доступа — никаких
+    изменений каталога здесь нет (маршруты записи появятся отдельно).
+    """
+    return admin
