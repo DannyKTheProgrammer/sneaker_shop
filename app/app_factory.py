@@ -16,8 +16,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.errors import ShopError, shop_error_handler
 from app.database import engine, ping
 from app.routers.auth import router as auth_router
+from app.routers.cart import router as cart_router
 from app.routers.catalog import router as catalog_router
 from app.routers.catalog_write import router as catalog_write_router
 
@@ -59,10 +61,11 @@ def _redact_validation_errors(errors: list[dict]) -> list[dict]:
 
 def build_app(*, include_writes: bool) -> FastAPI:
     """Собрать приложение; include_writes=True добавляет маршруты записи."""
-    version = "0.5.0" if include_writes else "0.2.0"
+    version = "0.6.0" if include_writes else "0.2.0"
     description = (
         "Учебный бэкенд магазина кроссовок. M3: чтение каталога, регистрация, "
-        "вход с выдачей JWT и запись каталога администратором."
+        "вход с выдачей JWT и запись каталога администратором. "
+        "M4: корзина пользователя (POST /cart/items)."
         if include_writes
         else "Учебный бэкенд магазина кроссовок. M2 (контрольная точка): "
              "только чтение каталога, запись не подключена."
@@ -78,6 +81,18 @@ def build_app(*, include_writes: bool) -> FastAPI:
     app.include_router(auth_router)
     if include_writes:
         app.include_router(catalog_write_router)
+        app.include_router(cart_router)
+
+    @app.exception_handler(ShopError)
+    async def handle_shop_error(request: Request, exc: ShopError) -> JSONResponse:
+        """Ошибки бизнес-уровня (корзина и далее) -> безопасный JSON.
+
+        Один обработчик на всё дерево ShopError вместо «лестницы except» в
+        каждом маршруте: тип исключения сам знает свой HTTP-код и текст
+        (app/core/errors.py). В тело уходит только detail — ни SQL, ни имён
+        ограничений БД, ни traceback.
+        """
+        return await shop_error_handler(request, exc)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:

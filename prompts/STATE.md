@@ -5,8 +5,9 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M3 завершён —
-запись каталога подключена и проверена матрицей, M2 остаётся контрольной точкой.
+Обновляется после каждого значимого шага. Последнее обновление: M4, часть 1
+— `POST /cart/items`: новая транзакция на операцию, порядок блокировок,
+дельты количества; обе приёмки (сервисная и HTTP) зелёные.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -44,12 +45,14 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
 * Временных учебных БД нет (в кластере только `postgres`, `sneaker_shop`,
   `template0`, `template1`).
 * API: две точки входа.
-  `app.store_main:app` (он же `app.main:app`) — **результат M3**, версия
-  `0.5.0`: чтение каталога, регистрация/вход/JWT и запись каталога
+  `app.store_main:app` (он же `app.main:app`) — **результат M3 + шаг M4**,
+  версия `0.6.0`: чтение каталога, регистрация/вход/JWT, запись каталога
   (`POST /products`, `PUT /products/{id}`, `DELETE /products/{id}`) под
-  `require_admin`.
+  `require_admin` и корзина пользователя (`POST /cart/items`) под обычной
+  аутентификацией.
   `app.catalog_main:app` — **контрольная точка M2**, версия `0.2.0`:
-  те же чтение и auth, но маршрутов записи каталога нет (405).
+  те же чтение и auth, но маршрутов записи каталога нет (405), а корзины
+  нет вовсе (404 — маршрут не зарегистрирован).
   У `/products` есть фильтры и пагинация: `brand_id`, `min_price`,
   `max_price`, `size`, `search`, `limit` (20, макс 100), `offset`.
 * Порт 8000: ученик держит на нём СВОЁ приложение разработки
@@ -67,16 +70,22 @@ requirements.txt        зафиксированные fastapi, uvicorn, pydanti
 alembic.ini             конфиг Alembic БЕЗ строки подключения (секретов нет)
 alembic/env.py          URL берётся из Config.set_main_option, иначе из settings
 alembic/versions/201c8afcccba_initial.py   единственная ревизия: семь таблиц
-app/app_factory.py      build_app(include_writes=...) — общая сборка: health, роутеры, обработчик 422
-app/store_main.py       app = build_app(include_writes=True)  — результат M3
+app/app_factory.py      build_app(include_writes=...) — общая сборка: health, роутеры,
+                        обработчики 422 и ShopError
+app/store_main.py       app = build_app(include_writes=True)  — результат M3 + M4
 app/catalog_main.py     app = build_app(include_writes=False) — контрольная точка M2
 app/main.py             app = build_app(include_writes=True)  — совместимость с прежними командами запуска
 app/core/config.py      load_dotenv(override=False); Settings: database_url и jwt_secret (SecretStr, оба обязательны),
                         jwt_algorithm=HS256, jwt_expire_minutes=15, jwt_issuer/audience
+app/core/errors.py      ShopError (+ ShopNotFound 404, ShopConflict 409) и shop_error_handler:
+                        в ответ уходит только detail — без SQL, имён ограничений и traceback
 app/database.py         один Engine, фабрика Session, ping() с SELECT 1
 app/main.py             FastAPI + GET /health + lifespan; подключает роутеры каталога и auth,
                         плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
+app/schemas/cart.py     CartItemAdd (вход: product_size_id + quantity, StrictInt 1..2147483647, extra=forbid)
+                        и CartItemRead (плоский ответ: id, product_size_id, product_id, name, size,
+                        price, quantity, stock, subtotal; Decimal -> строка)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
 app/core/security.py    пароли: CryptContext(bcrypt, rounds=12, truncate_error), validate_password,
                         hash_password, verify_password, dummy_hash (для входа без утечки по времени);
@@ -86,14 +95,20 @@ app/schemas/auth.py     UserRegister/UserLogin (email+password, extra=forbid), U
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
                         create_product, update_product, delete_product
                         (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict/ProductDeletedConflict)
+app/services/shop.py    корзина (M4): new_session() — СВЕЖАЯ сессия на операцию, add_cart_item
+                        (замок владельца -> замок размера -> поиск пары -> проверка int4 и stock -> commit),
+                        _load_cart_item с selectinload(CartItem.product_size -> ProductSize.product),
+                        to_read; ошибки CartItemNotFound/ProductSizeNotFound/CartStockConflict/CartConflict
 app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
                         authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email),
                         get_user_by_id (проверка токена)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET, публичные)
 app/routers/catalog_write.py  POST/PUT/DELETE каталога; весь роутер под dependencies=[Depends(require_admin)]
+app/routers/cart.py     POST /cart/items — корзина САМОГО пользователя (без require_admin),
+                        зависимость get_current_user_id (только id из проверенного токена)
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
-                        HTTPBearer + get_current_user/CurrentUser и require_admin/AdminUser
+                        HTTPBearer + get_current_user/CurrentUser, get_current_user_id и require_admin/AdminUser
 setup_jwt.py            генерация JWT_SECRET в .env без перезаписи существующего ключа
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
@@ -111,7 +126,8 @@ prompts/                тексты заданий модулей + этот ф
 `_write_service_probe.py`, `_delete_service_probe.py`,
 `_m2_contract_review.py`, `_auth_register_probe.py`, `_auth_login_probe.py`,
 `_jwt_probe.py`, `_auth_guard_probe.py`, `_write_matrix_probe.py`,
-`_m2_checkpoint_probe.py`, `check_env.py`, `sql/`.
+`_m2_checkpoint_probe.py`, `_m3_review_probe.py`, `_cart_service_probe.py`,
+`_cart_items_acceptance.ps1`, `_pg_admin.py`, `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -126,6 +142,44 @@ HTTP GET /products/10
 Правило разделения: в роутере нет SQL, в сервисе нет HTTP-ошибок, в схеме
 нет ORM-логики. Сессия приходит через `Depends(get_session)` из
 `app/database.py` (по одной на запрос, закрывается автоматически).
+
+## Путь запроса и транзакция корзины (M4)
+
+```
+HTTP POST /cart/items  {"product_size_id": 101, "quantity": 2}
+  app/routers/cart.py       CurrentUserId (id из токена) — не ORM-объект
+  app/services/shop.py      new_session()  — СВЕЖАЯ сессия на операцию
+    1. SELECT ... FROM users WHERE id = :id FOR UPDATE            (замок владельца)
+    2. SELECT ... FROM product_sizes WHERE id = :sid FOR UPDATE   (замок размера)
+    3. SELECT ... FROM products WHERE id = :pid                   (имя и цена)
+    4. SELECT ... FROM cart_items WHERE user_id, product_size_id  (есть строка?)
+    5. INSERT (нет строки) или UPDATE quantity += delta           (дельта!)
+    6. проверка: quantity <= 2147483647 и quantity <= stock       (иначе 409)
+    7. COMMIT; затем перечитывание позиции с размером и товаром
+  app/core/errors.py        ShopError -> JSON {"detail": ...} без SQL и имён ограничений
+```
+
+**Почему своя сессия.** Зависимость аутентификации (`get_current_user`) уже
+прочитала строку `users` в сессии из `get_session` и тем самым открыла
+транзакцию и снимок данных (READ COMMITTED — снимок на момент первого
+оператора). Если бы блокировку и проверку остатка делали в этой же
+транзакции, мы опирались бы на снимок, сделанный ДО захвата блокировки:
+типовая гонка «прочитал старое — записал новое». Поэтому корзина и checkout
+открывают новую сессию (`SessionLocal()`), а из слоя аутентификации в неё
+передаётся только `user.id`. ORM-объект из чужой сессии не передаётся.
+
+**Порядок блокировок один для корзины и checkout:**
+`users` FOR UPDATE → `product_sizes` по возрастанию id → (в checkout ещё
+`products` FOR SHARE по возрастанию id). Единый порядок захвата исключает
+взаимную блокировку; замки живут до COMMIT/ROLLBACK, то есть одну операцию.
+Замок владельца сериализует операции одного пользователя, поэтому две
+одновременные вставки не могут потерять одну из дельт; `UNIQUE(user_id,
+product_size_id)` остаётся страховкой от дубля пары.
+
+**Корзина не резервирует остаток:** `stock` не уменьшается ни на одном шаге
+M4. Проверяется только `quantity <= stock`; списание — задача checkout, где
+остаток перепроверяется под той же блокировкой (`UPDATE ... WHERE stock >=
+:qty`).
 
 ## БД: устройство и правила
 
@@ -207,6 +261,19 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 # 14) контрольная точка M2 (catalog_main на 8002): запись даёт 405, чтение публичное
 .\sneaker_shop_.venv\Scripts\python.exe -m uvicorn app.catalog_main:app --port 8002
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _m2_checkpoint_probe.py --port 8002
+
+# 15) ревью M3 целиком: 4 типа доступа × 3 метода, невалидные JWT, роли, публичность чтений
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _m3_review_probe.py --port 8001 --database <имя>
+
+# 16) КОРЗИНА, сервисный уровень (M4, часть 1; создаёт и удаляет СВОЮ временную БД):
+#     дельта/повтор, stock0, отсутствующий размер, переполнение int4, чужой владелец,
+#     реальный порядок блокировок из перехваченного SQL, ожидание замка, savepoint != commit
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _cart_service_probe.py
+
+# 17) КОРЗИНА, HTTP-приёмка (M4, часть 1): сама создаёт временную БД, поднимает
+#     store_main на 8001, регистрирует пользователя, проверяет 200/401/404/409/422,
+#     порядок блокировок в логе сервера и неизменность рабочей БД, потом всё убирает.
+powershell -NoProfile -File _cart_items_acceptance.ps1
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -427,19 +494,58 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   товара не трогает. Контрольная точка M2 (`_m2_checkpoint_probe.py`,
   catalog_main): каталог только GET, POST/PUT/DELETE/PATCH → 405, чтение
   публичное, регистрация и вход работают.
+* Ревью M3 (`_m3_review_probe.py`, своя временная БД, 51 реальный HTTP-запрос
+  с журналом): дефектов не найдено. Проверено фактически: ответы и ошибки не
+  содержат открытого пароля и `hashed_password`; в 422 нет `input`/`ctx` и
+  значения пароля; `is_admin` из тела, query и claims доступа не даёт;
+  отказы по подписи, `alg=none`, `HS512`, `exp`, `iss`, `aud`, `sub`
+  (не число / Unicode / > int4 / отрицательный / не строка) и удалённому
+  пользователю → 401; отсутствие токена → 401 (не 403), `WWW-Authenticate`
+  есть; `require_admin` на всех трёх методах; повышение и отзыв роли
+  действуют на уже выданный токен (403 → 200 → 403); повтор email → 409,
+  неверный пароль и неизвестный email → одинаковый 401; регистрация не
+  принимает `is_admin`; чтения (`/health`, `/brands`, `/products`,
+  `/products/10`, `/openapi.json`, `/docs`) публичны и данных не меняют;
+  Swagger: единственная схема `HTTPBearer`, логин — `application/json`,
+  все три маршрута записи помечены защищёнными.
+* M4 (часть 1, `POST /cart/items`): `_cart_service_probe.py` → все
+  проверки пройдены в отдельной временной БД, `_cart_items_acceptance.ps1`
+  → `ALL CART HTTP CHECKS PASSED` (сервер store_main на 8001 со своей
+  временной БД, потом уборка). Фактически проверено: первый вызов создаёт
+  позицию с `quantity=delta` (2 → 200, `id`, `product_size_id=101`,
+  `product_id=10`, `name='North Runner'`, `size='42.0'`, `price='7990.00'`,
+  `stock=3`, `subtotal='15980.00'`), повторный прибавляет дельту (2 → 3,
+  та же строка, `subtotal='23970.00'`); `stock` после всех вызовов остался
+  3 (корзина не резервирует). Отказы: `stock=0` (размер 102) → 409,
+  количество сверх остатка (4 при stock 3) → 409, отсутствующий размер
+  9999 → 404, `quantity=0`, `quantity=null`, `"5"`, `1.5`, `true`,
+  `2147483648`, `product_size_id=0`, лишнее поле (`user_id`, `price`),
+  пустое тело → 422, без токена и с мусорным токеном → 401. Второй
+  пользователь получает свою строку (другой `id`), корзина первого не
+  меняется. SQL в логе сервера: `SELECT ... FROM users ... FOR UPDATE OF
+  users` (первым), затем `SELECT ... FROM product_sizes ... FOR UPDATE OF
+  product_sizes`. Сервисная проба подтверждает независимо: перехваченный
+  порядок операторов `users FOR UPDATE → product_sizes FOR UPDATE →
+  products → cart_items → INSERT/UPDATE`, реальный `after_commit`,
+  ожидание второй транзакции на замке владельца (`statement_timeout`
+  срабатывает), переполнение int4 → 409 вместо 500, `begin_nested` без
+  `commit` данные не сохраняет, `UNIQUE(uq_cart_size)` отклоняет дубль
+  пары, несуществующий владелец → `ShopError` без строк, схема не
+  изменилась (8 таблиц, 7 FK, ревизия `201c8afcccba`), рабочая БД после
+  прогона не изменилась (`cart_items=0`, `stock=3`).
 
 ## Чего ещё нет
 
-* Записи в каталог по HTTP: маршруты POST/PUT/DELETE не
-  зарегистрированы до `require_admin`. Контракт `ProductWrite` и сервисы
-  `create_product`/`update_product`/`delete_product` готовы и проверены
-  вне HTTP.
-* Запись каталога подключена и защищена; `require_admin` работает. Корзины,
-  оформления заказа и связи товара с заказом через API ещё нет.
+* Корзина умеет ТОЛЬКО добавление (`POST /cart/items`). Просмотра корзины
+  (`GET /cart`), установки абсолютного количества (`PATCH`) и удаления
+  позиции (`DELETE`) ещё нет; checkout (`POST /orders`) не начат.
+* Запись каталога подключена и защищена; `require_admin` работает.
+  Оформления заказа и связи товара с заказом через API ещё нет.
 * Публичного маршрута назначения администратора нет: роль меняется только
   прямым UPDATE в БД (для приёмки админ создаётся так же).
 * **Отложенное требование M2 закрыто** матрицей записи на результата M3
-  (часть 9). Осталось на будущие модули: корзина и оформление заказа.
+  (часть 9). Осталось на будущие модули: остальные операции корзины и
+  оформление заказа.
 * Swagger не умеет логиниться JSON-формой: `HTTPBearer` — это только поле
   для вставки токена. Порядок: вызвать `/auth/login`, затем Authorize.
 * Постоянное время ответа входа не гарантируется: dummy_hash выравнивает
@@ -454,18 +560,90 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 * Постраничности с `total` нет намеренно: массивы без обёртки. Состав
   страниц не гарантирован при параллельных вставках/удалениях
   (keyset-пагинация — отдельная задача).
-* Корзины, оформления заказа, регистрации и JWT — нет.
+* Корзины (кроме добавления), оформления заказа — нет. Регистрация и JWT
+  сделаны в M3.
 * Каскадного удаления и обработчиков покупки нет намеренно.
 * Не проверялись: конкурентное списание остатка, гонка при оформлении,
   `ON DELETE` на практике, `alembic downgrade` в последнем прогоне.
+* В этом шаге НЕ перезапускались наборы M3 (`_write_matrix_probe.py`,
+  `_m2_contract_review.py`, `_m3_review_probe.py`) и `_auth_*`: изменения
+  M4 к ним не относятся (правки ровно в `app/app_factory.py` — новый
+  роутер и обработчик ShopError, `app/routers/auth.py` — новая зависимость
+  `get_current_user_id`) плюс новые файлы. Регрессия проверена точечно:
+  чтения каталога, `/health`, 401 на записи каталога без токена, 405 в
+  контрольной точке M2 (корзины там нет — 404).
 
 ## Следующий шаг
 
-M3, часть 10 (по заданию ученика) — либо переход к корзине: `POST /cart`,
-`GET /cart`, изменение количества, удаление позиции; затем оформление
-заказа (`POST /orders`) одной транзакцией с контролем остатка
+Остальные операции корзины по заданию ученика: `GET /cart` (своя корзина с
+позициями и суммой), `PATCH /cart/items/{id}` (абсолютное количество;
+`{id}` — id строки cart_items, чужая или отсутствующая → 404), `DELETE
+/cart/items/{id}` → 204. Затем оформление заказа (`POST /orders`) одной
+транзакцией с контролем остатка
 (`UPDATE product_sizes SET stock = stock - :qty WHERE id = :id AND stock >= :qty`)
 и снимком цены в `order_items.price_at_purchase`.
-Напоминание: админские маршруты каталога уже защищены, поэтому при
-добавлении новых маршрутов записи их защиту нужно решать отдельно
-(корзина — это маршруты самого пользователя, не администратора).
+Напоминание: корзина — маршруты самого пользователя (без `require_admin`),
+но с теми же правилами: свежая сессия на операцию, `user.id` из токена,
+порядок блокировок `users → product_sizes → products`.
+
+## Правила написания приёмочных скриптов (грабли, на которые уже наступали)
+
+Короткий список, чтобы в новой сессии не повторять одни и те же ошибки
+вспомогательных скриптов (`_*_probe.py`). Код приложения тут ни при чём —
+это про инструменты проверки.
+
+1. **`urllib` шлёт GET, если `data=None`**, даже когда в `Request` передан
+   `method="POST"`. Поэтому тело задаётся всегда (`b""` для запросов без
+   тела), иначе POST/DELETE молча уходят как GET и приходит 405 — выглядит
+   как «дефект маршрута», хотя дефект в пробе.
+2. **Аргументы HTTP-хелпера передавать только именованными.** Один раз
+   `"POST"` попал в позиционный параметр `token` и ушёл как
+   `Authorization: Bearer POST` при методе GET.
+3. **Читать атрибуты ORM-объекта внутри сессии**: после выхода из
+   `with Session(...)` объект отсоединён, и `obj.id` даёт
+   `DetachedInstanceError`.
+4. **Порядок удаления фикстур**: сначала `order_items`/`orders`/`cart_items`,
+   затем `product_sizes`, только потом `products` (иначе FK не даст).
+5. **`DROP DATABASE` не выполняется в одной транзакции с другими
+   операторами** — по одному `-c` на базу.
+6. **Не полагаться на seed как на фикстуру**: свои товары/пользователи
+   создавать в самой пробе, с фиксированными id в стороне от 1..30
+   (использованы 9001/9002, 9101/9102), и делать уборку в начале прогона,
+   а не только в конце — тогда повторный запуск не ломается.
+7. **Снимок данных делать через `to_jsonb(t)::text`**, а не `UNION` с
+   `::text` по колонкам: типы колонок не согласуются, и запрос падает.
+8. **Проверять неизменность данных только у отказов.** Для успешных
+   операций (201/200/204) ожидается изменение — сравнение «до == после»
+   там неверно по смыслу.
+9. **Печатать журнал фактически выполненных запросов** (метод, путь, какой
+   заголовок отправлен, код ответа). Это отделяет настоящие HTTP-запросы от
+   «демонстрационной матрицы» и ускоряет разбор.
+10. **Каждая приёмка — своя временная БД** (`_review_m01_probe.py --phase
+    setup`), потому что пробы пишут и удаляют данные и портят ожидания
+    друг друга. Своя БД на пробу, потом `--phase teardown`.
+11. **Порт брать не 8000**: там работает приложение ученика с `--reload`.
+    Приёмки идут на 8001 (`store_main`) и 8002 (`catalog_main`).
+12. **Перед прогоном убедиться, что на порту нет осиротевшего процесса от
+    прошлой сессии**: старый сервер держит порт и старую БД, а новый не
+    поднимается — в итоге проверки идут не против того кода, который
+    собран сейчас.
+13. **URL временной БД задавать в окружении ДО первого импорта `app.*`**:
+    `alembic upgrade` внутри прогона импортирует `alembic/env.py`, а тот —
+    `app.models` и `app.core.config`, поэтому Engine и `SessionLocal` в
+    `app/database.py` строятся на уровне модуля. Если выставить
+    `DATABASE_URL` после этого, сервисы останутся подключены к рабочей БД —
+    проба будет писать в неё, а свои проверки читать из временной (на эти
+    грабли уже наступали: в рабочей БД появились лишние строки
+    `cart_items`). Признак — сервис отвечает, а в своей БД строк нет.
+    Поэтому в `_cart_service_probe.py` переменная задаётся в начале модуля,
+    а в `_cart_items_acceptance.ps1` есть отдельная проверка
+    «рабочая БД пуста перед вызовами».
+14. **В PowerShell 5.1 тело JSON не передавать аргументом `curl.exe`**:
+    кавычки и фигурные скобки переразбираются, тело приходит битым и
+    FastAPI отвечает `422 json_invalid`. Тело писать в файл и передавать
+    `--data-binary @file`. Скрипты `.ps1` держать ASCII: кириллица без BOM
+    ломает парсер (проверено на `_cart_items_acceptance.ps1`).
+15. **`docker compose exec` из песочницы агента недоступен** (named pipe
+    демона закрыт в режиме `workspace-write`): для служебных
+    CREATE/DROP DATABASE HTTP-приёмка использует `_pg_admin.py` (psycopg
+    напрямую, реквизиты из `.env`), а не `psql` внутри контейнера.

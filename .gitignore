@@ -28,6 +28,8 @@ check_env.py
 _http_acceptance.ps1
 _seed_acceptance.ps1
 _catalog_acceptance.ps1
+*_acceptance.ps1
+_pg_admin.py
 _logging.json
 sql/
 
