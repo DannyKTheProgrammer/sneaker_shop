@@ -48,6 +48,22 @@ class CartItemAdd(BaseModel):
     quantity: Quantity
 
 
+class CartItemUpdate(BaseModel):
+    """Вход PATCH /cart/items/{item_id}: АБСОЛЮТНОЕ количество.
+
+    Не путать с CartItemAdd: там quantity — прибавка, здесь — итоговое
+    значение («сделай ровно 3»). Ноль и отрицательные отклоняются схемой
+    (422), потому что в cart_items стоит CHECK quantity > 0: чтобы убрать
+    позицию, её удаляют, а не обнуляют. Лишние поля запрещены: `user_id`,
+    `product_size_id` и `price` не принимаются — владельца берут из токена,
+    а размер и цену позиция уже содержит.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    quantity: Quantity
+
+
 class CartProductRead(BaseModel):
     """Товар внутри позиции корзины: только нужные клиенту поля."""
 

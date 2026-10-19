@@ -43,7 +43,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.errors import ShopConflict, ShopError, ShopNotFound
 from app.database import SessionLocal
 from app.models import CartItem, Product, ProductSize, User
-from app.schemas.cart import CartItemAdd, CartItemRead, CartRead
+from app.schemas.cart import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
 
 # SQLSTATE нарушения уникальности в PostgreSQL (как в services/auth.py).
 UNIQUE_VIOLATION = "23505"
@@ -257,6 +257,132 @@ def add_cart_item(session: Session, user_id: int, data: CartItemAdd) -> CartItem
     if saved is None:  # pragma: no cover - сразу после commit строки быть не может
         raise CartItemNotFound()
     return to_read(saved)
+
+
+# --- изменение и удаление позиции (M4, шаг 3) ----------------------------
+#
+# Ключевое отличие от add_cart_item: позиция адресуется своим id (id строки
+# cart_items), а не парой (user, size). Из этого сразу следует вопрос
+# доступа: чужой id не должен быть ни виден, ни изменяем. Ответ на него —
+# одна выборка `_get_owned_item`, где в WHERE одновременно стоят и id, и
+# user_id. Ниже — почему именно так, а не «прочитать, потом сравнить».
+
+
+def _get_owned_item(session: Session, user_id: int, item_id: int) -> CartItem | None:
+    """Позиция, которая одновременно имеет id=item_id И принадлежит user_id.
+
+    ОДИН SELECT с двумя условиями в WHERE:
+
+        SELECT ... FROM cart_items
+        WHERE cart_items.id = :item_id AND cart_items.user_id = :user_id
+
+    Почему это важнее, чем «найти по id, потом сравнить user_id в Python»:
+
+    * Нет окна между проверкой и использованием. При двух шагах строка
+      читается одной транзакцией, а проверяется в Python; при одном
+      запросе условие владельца — часть того же SELECT, и «между» ничего
+      не вставить.
+    * Чужой id неотличим от несуществующего: оба дают 404 и одинаковое
+      тело ответа, поэтому по ответу нельзя выяснить, существует ли у
+      кого-то ещё позиция с таким id (это утечка, oracle по коду ответа).
+    * Нельзя забыть фильтр: он в одном месте, а не в каждом вызове.
+    * Дешевле: один запрос вместо двух на каждый вызов.
+
+    Возвращаем None (а не исключение): «не найдено» и «чужое» — для
+    вызывающего одно и то же, и он сам решает, что это 404.
+
+    Блокировку (FOR UPDATE) здесь НЕ берём: строка cart_items защищена
+    замком владельца (users FOR UPDATE, шаг 1), который уже взят
+    вызывающей функцией, а сама позиция меняется только в этой транзакции.
+    """
+    return session.execute(
+        select(CartItem).where(
+            CartItem.id == item_id,
+            CartItem.user_id == user_id,
+        )
+    ).scalar_one_or_none()
+
+
+def update_cart_item(
+    session: Session, user_id: int, item_id: int, data: CartItemUpdate
+) -> CartItemRead:
+    """Установить АБСОЛЮТНОЕ количество позиции (PATCH).
+
+    Порядок шагов (тот же протокол, что у остальных операций корзины):
+
+    1. заблокировать владельца (users FOR UPDATE);
+    2. найти позицию одной выборкой по (id, user_id): нет или чужая →
+       CartItemNotFound (404). Замок владельца гарантирует, что эту строку
+       не удалит и не изменит параллельная операция того же пользователя,
+       пока мы работаем;
+    3. заблокировать размер позиции (product_sizes FOR UPDATE) — он нужен
+       для проверки остатка, и остаток не должен измениться до COMMIT;
+    4. проверить `quantity <= stock`: иначе CartStockConflict (409).
+       Ноль и отрицательные сюда не доходят — их отсекает схема (422), а
+       нижняя граница ещё и CHECK quantity > 0 в БД;
+    5. записать quantity = data.quantity (ЗАМЕНА, не прибавка) и commit.
+
+    Ответ 200 с той же формой, что у POST /cart/items: клиенту после
+    PATCH обычно нужен пересчитанный subtotal.
+
+    Почему запись количества не может «переполнить» int4: схема ограничивает
+    quantity сверху 2147483647, а сама запись — присваивание, не сложение.
+    Поэтому проверки на переполнение здесь нет (она нужна только в POST,
+    где количество суммируется).
+    """
+    _lock_user(session, user_id)
+
+    item = _get_owned_item(session, user_id, item_id)
+    if item is None:
+        raise CartItemNotFound()
+
+    product_size = _lock_product_size(session, item.product_size_id)
+    product = _get_product(session, product_size.product_id)
+
+    if data.quantity > product_size.stock:
+        raise CartStockConflict(
+            f"Only {product_size.stock} item(s) of this size are in stock"
+        )
+
+    item.quantity = data.quantity
+
+    try:
+        session.commit()
+    except IntegrityError as exc:  # pragma: no cover - схема уже проверила диапазон
+        # Сюда можно попасть только при гонке с ограничением целостности
+        # (например, CHECK quantity > 0, если схему когда-нибудь поменяют).
+        session.rollback()
+        raise
+
+    # DTO собираем из объектов, которые уже держим: после commit с
+    # expire_on_commit=False значения не просрочены, а связи (размер и
+    # товар) прочитаны явно. Лишнего SELECT на ответ нет.
+    return _item_read(item, product_size, product)
+
+
+def delete_cart_item(session: Session, user_id: int, item_id: int) -> None:
+    """Удалить свою позицию из корзины (DELETE → 204).
+
+    Шаги: заблокировать владельца → найти позицию по (id, user_id) → удалить
+    строку → commit.
+
+    Размер (product_sizes) здесь НЕ блокируется: остаток не меняется ни на
+    единицу, а значит и защищать нечего. Это же отличие от checkout, где
+    списание остатка требует замка на строку размера.
+
+    Чужая позиция — тот же CartItemNotFound (404), что и отсутствующая.
+    Повторный DELETE того же id тоже даёт 404 (строки уже нет), а не 204:
+    идемпотентности у нас нет намеренно, иначе было бы невозможно отличить
+    «удалил» от «и не было».
+    """
+    _lock_user(session, user_id)
+
+    item = _get_owned_item(session, user_id, item_id)
+    if item is None:
+        raise CartItemNotFound()
+
+    session.delete(item)
+    session.commit()
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:

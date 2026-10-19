@@ -5,10 +5,15 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M4, часть 2
-— `GET /cart`: один JOIN-запрос, стабильный порядок по id, ориентировочная
-сумма `estimated_total` по текущим ценам каталога; три набора проверок
-зелёные (сервисный и HTTP по прошлому шагу, сервисный и HTTP по этому).
+Обновляется после каждого значимого шага. Последнее обновление: M4, часть 3
+— `PATCH /cart/items/{item_id}` и `DELETE /cart/items/{item_id}` плюс
+сценарий изоляции корзин для всех четырёх операций (Аня / Борис / админ):
+чужая позиция всегда 404, состояние БД до и после отказов совпадает.
+
+Данные ученика в рабочей БД: `users` содержит три строки, включая
+`danny@gmail.comm` (создана вручную в его приложении на 8000), и одну
+строку `cart_items` (его собственный тест). Их не удалять и не считать
+мусором проверок.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -40,17 +45,20 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
   `product_sizes`, `users`, `cart_items`, `orders`, `order_items`)
   плюс служебная `alembic_version`.
 * Данные в рабочей БД: `brands=2`, `products=3`, `product_sizes=4`,
-  а в `users` — две записи, созданные учеником через GUI
-  (`danny@gmail.com`, `admin@example.com`). Их не удалять: это не мусор
-  проверок. `cart_items=0`, `orders=0`, `order_items=0`.
+  `orders=0`, `order_items=0`; в `users` — три записи, созданные учеником
+  вручную (`danny@gmail.com`, `admin@example.com`, `danny@gmail.comm`), и
+  одна строка `cart_items` (size 101, quantity 2) — его собственный тест
+  корзины в собственном приложении. Это не мусор проверок: не удалять и не
+  строить на «пустой рабочей БД» никаких утверждений (см. правило 17).
 * Временных учебных БД нет (в кластере только `postgres`, `sneaker_shop`,
   `template0`, `template1`).
 * API: две точки входа.
   `app.store_main:app` (он же `app.main:app`) — **результат M3 + шаги M4**,
-  версия `0.7.0`: чтение каталога, регистрация/вход/JWT, запись каталога
+  версия `0.8.0`: чтение каталога, регистрация/вход/JWT, запись каталога
   (`POST /products`, `PUT /products/{id}`, `DELETE /products/{id}`) под
-  `require_admin` и корзина пользователя (`POST /cart/items`, `GET /cart`)
-  под обычной аутентификацией.
+  `require_admin` и корзина пользователя (`POST /cart/items`, `GET /cart`,
+  `PATCH /cart/items/{item_id}`, `DELETE /cart/items/{item_id}`) под обычной
+  аутентификацией.
   `app.catalog_main:app` — **контрольная точка M2**, версия `0.2.0`:
   те же чтение и auth, но маршрутов записи каталога нет (405), а корзины
   нет вовсе (404 — маршрут не зарегистрирован).
@@ -85,6 +93,7 @@ app/main.py             FastAPI + GET /health + lifespan; подключает �
                         плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/cart.py     CartItemAdd (вход: product_size_id + quantity, StrictInt 1..2147483647, extra=forbid),
+                        CartItemUpdate (вход PATCH: только quantity, абсолютное значение),
                         CartItemRead (плоский ответ: id, product_size_id, product_id, name, size,
                         price, quantity, stock, subtotal; Decimal -> строка) и CartRead
                         (items + estimated_total — ориентировочная сумма)
@@ -101,16 +110,20 @@ app/services/shop.py    корзина (M4): new_session() — СВЕЖАЯ се
                         (замок владельца -> замок размера -> поиск пары -> проверка int4 и stock -> commit),
                         _load_cart_item с selectinload(CartItem.product_size -> ProductSize.product),
                         to_read / _item_read, get_cart + _cart_rows (один SELECT с JOIN sizes и products,
-                        ORDER BY cart_items.id, estimated_total по текущим ценам);
+                        ORDER BY cart_items.id, estimated_total по текущим ценам),
+                        _get_owned_item (ОДИН SELECT: cart_items.id AND cart_items.user_id),
+                        update_cart_item (абсолютное quantity, проверка stock), delete_cart_item;
                         ошибки CartItemNotFound/ProductSizeNotFound/CartStockConflict/CartConflict
 app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
                         authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email),
                         get_user_by_id (проверка токена)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET, публичные)
 app/routers/catalog_write.py  POST/PUT/DELETE каталога; весь роутер под dependencies=[Depends(require_admin)]
-app/routers/cart.py     POST /cart/items (дельта) и GET /cart (своя корзина) — маршруты САМОГО
-                        пользователя (без require_admin), зависимость get_current_user_id
-                        (только id из проверенного токена; параметра user_id у маршрутов нет)
+app/routers/cart.py     POST /cart/items (дельта), GET /cart, PATCH /cart/items/{item_id} (абсолютное
+                        количество), DELETE /cart/items/{item_id} (204) — маршруты САМОГО пользователя
+                        (без require_admin), зависимость get_current_user_id (только id из проверенного
+                        токена; параметра user_id нет, а ItemId = Path(ge=1, le=2147483647) отсекает
+                        нечисловой/нулевой id как 422)
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
                         HTTPBearer + get_current_user/CurrentUser, get_current_user_id и require_admin/AdminUser
@@ -133,7 +146,8 @@ prompts/                тексты заданий модулей + этот ф
 `_jwt_probe.py`, `_auth_guard_probe.py`, `_write_matrix_probe.py`,
 `_m2_checkpoint_probe.py`, `_m3_review_probe.py`, `_cart_service_probe.py`,
 `_cart_items_acceptance.ps1`, `_cart_get_service_probe.py`,
-`_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_pg_admin.py`,
+`_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_cart_isolation_probe.py`,
+`_pg_admin.py`,
 `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
@@ -180,6 +194,40 @@ HTTP GET /cart            (заголовок Authorization, БЕЗ параме
     4. сессия закрывается (COMMIT не нужен: только чтение, в логе ROLLBACK)
   app/schemas/cart.py       CartRead {items, estimated_total}
 ```
+
+```
+HTTP PATCH  /cart/items/{item_id}  {"quantity": 3}      (абсолютное значение)
+HTTP DELETE /cart/items/{item_id}                        (204, тело пустое)
+  app/routers/cart.py       ItemId = Path(ge=1, le=int4): 'abc', '0', '-1' -> 422
+  app/services/shop.py      new_session()
+    1. SELECT ... FROM users WHERE id = :id FOR UPDATE               (замок владельца)
+    2. SELECT ... FROM cart_items
+        WHERE cart_items.id = :item_id AND cart_items.user_id = :uid  (ОДНА выборка!)
+        -> None => CartItemNotFound (404), и это ОДИН И ТОТ ЖЕ ответ
+           для «нет такой позиции» и «позиция чужая»
+    3. PATCH:  SELECT ... FROM product_sizes WHERE id = :sid FOR UPDATE
+               (замок размера, ради проверки остатка)
+               quantity > stock -> 409, данные не меняются
+               UPDATE cart_items SET quantity = :q         (замена, не прибавка)
+       DELETE: без замка размера — остаток не меняется;
+               DELETE FROM cart_items WHERE id = :item_id  (уже проверено, что своя)
+    4. COMMIT; ответ PATCH — CartItemRead, ответ DELETE — 204 без тела
+```
+
+**Почему выборка позиции одна, а не «найти, потом сравнить владельца».**
+Условие `id AND user_id` стоит в одном `WHERE`, поэтому: между проверкой и
+использованием нет окна; нельзя забыть фильтр в одном из вызовов; чужой id
+неотличим от несуществующего, и по ответу нельзя выяснить, есть ли у
+кого-то позиция с таким id (иначе — «оракул существования»); и это один
+запрос вместо двух. `FOR UPDATE` на самой строке не нужен: строку защищает
+замок владельца, который взят первым шагом.
+
+**Администратор — не исключение.** Маршруты корзины не используют
+`require_admin` вообще: роль проверяется только на административных
+маршрутах каталога (и будущей смены статуса заказа). Поэтому администратор
+для чужой корзины — обычный пользователь: PATCH и DELETE чужой позиции дают
+те же 404, что и у любого другого. Ни чтения, ни изменения чужих корзин
+через API не существует.
 
 **Почему сумма ориентировочная (`estimated_total`), а цена заказа
 фиксируется позже.** Корзина — это намерение, а не покупка: в ней нет ни
@@ -334,6 +382,14 @@ powershell -NoProfile -File _cart_items_acceptance.ps1
 #     два пользователя, ?user_id игнорируется, 401 без токена, смена цены через админский
 #     PUT /products/10 (роль выдаётся SQL через _cart_get_fixtures.py), 405 на POST /cart.
 powershell -NoProfile -File _cart_get_acceptance.ps1
+
+# 20) ИЗОЛЯЦИЯ ВСЕХ ЧЕТЫРЁХ ОПЕРАЦИЙ КОРЗИНЫ (M4, часть 3): воспроизводимый сценарий
+#     Аня / Борис / администратор. Своя временная БД, свой сервер на 8001, свой лог.
+#     Проверяет: Борис видит [], PATCH и DELETE чужой позиции -> 404 у Бориса и у админа,
+#     одинаковое тело отказа, состояние БД до/после отказов, четыре операции без JWT -> 401,
+#     204/409/422 на своих данных, SQL «id AND user_id в одном WHERE», отсутствие
+#     токенов и паролей в отчёте. Всё убирает за собой.
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _cart_isolation_probe.py
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -621,12 +677,40 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   `price(10)=7990.00`, временных БД не осталось. Регрессия: `POST`-наборы
   части 1 (`_cart_service_probe.py`, `_cart_items_acceptance.ps1`)
   перезапущены после рефакторинга `to_read` → `_item_read` — зелёные.
+  Примечание: проверка «в рабочей БД нет корзин» позже оказалась неверной
+  и заменена (см. правило 17) — ученик работает в этой БД сам.
+* M4 (часть 3, `PATCH`/`DELETE` + изоляция): `_cart_isolation_probe.py` →
+  `ALL CART ISOLATION CHECKS PASSED` (своя временная БД, свой сервер на
+  8001, свой лог; сценарий: Аня добавляет size 101 ×2, Борис видит `[]` и
+  `"0.00"`, админ видит `[]`). Фактически проверено: Борис `PATCH` и
+  `DELETE` по id позиции Ани → 404 с телом `{"detail":"Cart item not
+  found"}`; администратор — те же 404 и то же тело (роль не даёт доступа к
+  чужим корзинам); полное состояние пяти таблиц (`cart_items`, `users`,
+  `product_sizes`, `orders`, `order_items`, сравнение `to_jsonb`) до и после
+  четырёх отказов совпало, позиция Ани осталась `quantity=2`, остаток
+  size 101 — 3. Свои данные работают: Борис `PATCH` своей позиции → 200
+  (quantity 4, `subtotal="23960.00"` по цене 5990.00), `PATCH` до 6 при
+  остатке 5 → 409 и количество осталось 4, `DELETE` своей → 204 с пустым
+  телом; Аня `PATCH` до 3 (`subtotal="23970.00"`), до 4 → 409 (состояние не
+  изменилось), `quantity=0` → 422, лишнее `user_id` → 422, `DELETE` → 204,
+  повторный → 404. Без JWT: `GET /cart`, `POST /cart/items`,
+  `PATCH /cart/items/999999`, `DELETE /cart/items/999999` → 401, состояние
+  не изменилось. Несуществующий id 999999 → 404, `abc`/`0`/`-1` → 422.
+  SQL в логе сервера: 13 выборок с `WHERE cart_items.id = ... AND
+  cart_items.user_id = ...` — то есть каждая операция PATCH/DELETE берёт
+  позицию одной выборкой (единственные SELECT-ы «только по id» — это ответ
+  POST /cart/items, который читает уже проверенную строку). В отчёте
+  проверено отсутствие токенов и пароля. После прогона в рабочей БД нет
+  пользователей этого прогона (проверка по email с суффиксом), временная
+  БД удалена. Все прежние наборы M4 перезапущены — зелёные.
 
 ## Чего ещё нет
 
-* Корзина умеет добавление (`POST /cart/items`) и чтение (`GET /cart`).
-  Установки абсолютного количества (`PATCH`) и удаления позиции (`DELETE`)
-  ещё нет; checkout (`POST /orders`) не начат.
+* Корзина готова целиком: добавление (`POST /cart/items`), чтение
+  (`GET /cart`), абсолютное количество (`PATCH /cart/items/{item_id}`),
+  удаление (`DELETE /cart/items/{item_id}`). Checkout (`POST /orders`),
+  смена статуса заказа (`403` неадминистратору) и списание остатка не
+  начаты.
 * Запись каталога подключена и защищена; `require_admin` работает.
   Оформления заказа и связи товара с заказом через API ещё нет.
 * Публичного маршрута назначения администратора нет: роль меняется только
@@ -663,18 +747,15 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-Остальные операции корзины по заданию ученика: `PATCH /cart/items/{id}`
-(абсолютное количество; `{id}` — id строки cart_items, чужая или
-отсутствующая → 404) и `DELETE /cart/items/{id}` → 204. Затем оформление
-заказа (`POST /orders`) одной транзакцией с контролем остатка
+Оформление заказа (`POST /orders`) одной транзакцией с контролем остатка
 (`UPDATE product_sizes SET stock = stock - :qty WHERE id = :id AND stock >= :qty`)
-и снимком цены в `order_items.price_at_purchase`.
+и снимком цены в `order_items.price_at_purchase`; затем смена статуса заказа
+администратором (`403` неадминистратору — это единственное место корзины и
+заказа, где нужен `require_admin`).
 Напоминание: корзина — маршруты самого пользователя (без `require_admin`),
 но с теми же правилами: свежая сессия на операцию, `user.id` из токена,
-порядок блокировок `users → product_sizes → products`. Для `PATCH`/`DELETE`
-дополнительно нужно решить: проверять ли `stock` при `PATCH` (да, если
-количество увеличивается) и как искать строку — `WHERE cart_items.id = :id
-AND cart_items.user_id = :uid` (чужой id неотличим от отсутствующего → 404).
+порядок блокировок `users → product_sizes → products`, и позиция всегда
+ищется одной выборкой `WHERE cart_items.id = :id AND cart_items.user_id = :uid`.
 
 ## Правила написания приёмочных скриптов (грабли, на которые уже наступали)
 
@@ -744,3 +825,17 @@ AND cart_items.user_id = :uid` (чужой id неотличим от отсут
     демона закрыт в режиме `workspace-write`): для служебных
     CREATE/DROP DATABASE HTTP-приёмка использует `_pg_admin.py` (psycopg
     напрямую, реквизиты из `.env`), а не `psql` внутри контейнера.
+17. **Не утверждать «рабочая БД пуста»**. Ученик работает в своём
+    приложении на 8000 против `sneaker_shop`, поэтому в ней законно
+    появляются его пользователи и строки корзины. Проверка изоляции должна
+    быть привязана к ДАННЫМ ПРОГОНА: адрес с случайным суффиксом не должен
+    появляться в рабочей БД (`_cart_get_fixtures.py has-email`, либо запрос
+    по email внутри пробы). Такая проверка ловит настоящий дефект («сервер
+    писал не в свою БД») и не ломается от действий ученика. На эти грабли
+    уже наступали: приёмочная проверка «cart_items=0» упала из-за его
+    собственного теста.
+18. **Изоляцию и сценарии с ролями писать на Python, а не на PowerShell**:
+    `_cart_isolation_probe.py` сам поднимает uvicorn (stdio в файл, не в
+    pipe), сам создаёт и удаляет временную БД и не зависит от капризов
+    PS 5.1 с кодировкой и here-string. HTTP — через `urllib`, тело всегда
+    передаётся (`b""`), токены не печатаются.

@@ -15,10 +15,10 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Path, Response, status
 
 from app.routers.auth import get_current_user_id
-from app.schemas.cart import CartItemAdd, CartItemRead, CartRead
+from app.schemas.cart import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
 from app.services import shop as shop_service
 
 router = APIRouter(prefix="/cart", tags=["cart"])
@@ -27,6 +27,12 @@ router = APIRouter(prefix="/cart", tags=["cart"])
 # ORM-объект принадлежит сессии зависимости и «переезжать» в свежую
 # транзакцию не должен (см. комментарий в app/services/shop.py).
 CurrentUserId = Annotated[int, Depends(get_current_user_id)]
+
+# id строки cart_items в пути. Обычный int с границами колонки int4: пути
+# `/cart/items/abc`, `/cart/items/0` и `/cart/items/-1` отсекает Pydantic
+# (422), и только корректный по форме, но несуществующий id доходит до
+# запроса и превращается в 404.
+ItemId = Annotated[int, Path(ge=1, le=2147483647, description="id строки cart_items")]
 
 
 @router.get(
@@ -107,3 +113,72 @@ def add_cart_item(payload: CartItemAdd, user_id: CurrentUserId) -> CartItemRead:
     """
     with shop_service.new_session() as session:
         return shop_service.add_cart_item(session, user_id, payload)
+
+
+@router.patch(
+    "/items/{item_id}",
+    response_model=CartItemRead,
+    status_code=status.HTTP_200_OK,
+    summary="Установить абсолютное количество позиции",
+    responses={
+        200: {"description": "Количество заменено (не прибавлено), вернулась обновлённая позиция"},
+        400: {"description": "Пользователь из токена больше не существует"},
+        401: {"description": "Токен отсутствует или недействителен"},
+        404: {"description": "Позиции с таким id нет ИЛИ она принадлежит другому пользователю"},
+        409: {"description": "Запрошенное количество больше остатка на складе"},
+        422: {"description": "Невалидные данные: quantity вне 1..2147483647, лишние поля, нечисловой id"},
+    },
+)
+def update_cart_item(
+    item_id: ItemId,
+    payload: CartItemUpdate,
+    user_id: CurrentUserId,
+) -> CartItemRead:
+    """Заменить количество позиции на `quantity` (абсолютное значение).
+
+    `item_id` — это id строки `cart_items` (не id размера и не id товара):
+    позиция адресуется своим идентификатором, а размер и товар в ней уже
+    записаны.
+
+    Изоляция корзин. Владелец берётся из токена, а позиция ищется ОДНОЙ
+    выборкой с двумя условиями — `cart_items.id = :item_id AND
+    cart_items.user_id = :user_id`. Поэтому:
+
+    * чужой id неотличим от несуществующего: 404 и одинаковое тело ответа;
+    * по коду ответа нельзя узнать, существует ли позиция у кого-то ещё;
+    * администратор здесь тоже обычный пользователь: у роли нет доступа к
+      чужим корзинам, и он получит те же 404.
+
+    Количество — итоговое, а не прибавляемое (прибавка — это POST). Ноль и
+    отрицательные отклоняет схема (422): чтобы убрать позицию, её удаляют.
+    Количество больше остатка — 409, и данные при этом не меняются.
+    """
+    with shop_service.new_session() as session:
+        return shop_service.update_cart_item(session, user_id, item_id, payload)
+
+
+@router.delete(
+    "/items/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Удалить свою позицию из корзины",
+    responses={
+        204: {"description": "Позиция удалена, тело ответа пустое"},
+        400: {"description": "Пользователь из токена больше не существует"},
+        401: {"description": "Токен отсутствует или недействителен"},
+        404: {"description": "Позиции с таким id нет ИЛИ она принадлежит другому пользователю"},
+        422: {"description": "Нечисловой или неположительный id позиции"},
+    },
+)
+def delete_cart_item(item_id: ItemId, user_id: CurrentUserId) -> Response:
+    """Удалить свою позицию; успех — 204 с пустым телом.
+
+    Тот же принцип изоляции, что у PATCH: одна выборка по (id, user_id).
+    Чужая позиция → 404, повторное удаление → 404 (строки уже нет), и ни
+    один отказ ничего не меняет в БД.
+
+    Остаток не трогаем: корзина не резервирует товар, поэтому удаление
+    позиции не возвращает и не списывает ни одной пары.
+    """
+    with shop_service.new_session() as session:
+        shop_service.delete_cart_item(session, user_id, item_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
