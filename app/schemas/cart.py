@@ -39,7 +39,7 @@ class CartItemAdd(BaseModel):
 
     Поле quantity — это ДЕЛЬТА (прибавка) для этого маршрута: 2 означает
     «добавь ещё две пары», а не «сделай ровно 2». Абсолютную установку
-    количества делает PATCH отдельным шагом (следующая часть M4).
+    делает PATCH /cart/items/{item_id} с CartItemUpdate.
     """
 
     model_config = ConfigDict(extra="forbid")
