@@ -5,9 +5,10 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M4, часть 1
-— `POST /cart/items`: новая транзакция на операцию, порядок блокировок,
-дельты количества; обе приёмки (сервисная и HTTP) зелёные.
+Обновляется после каждого значимого шага. Последнее обновление: M4, часть 2
+— `GET /cart`: один JOIN-запрос, стабильный порядок по id, ориентировочная
+сумма `estimated_total` по текущим ценам каталога; три набора проверок
+зелёные (сервисный и HTTP по прошлому шагу, сервисный и HTTP по этому).
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -45,11 +46,11 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
 * Временных учебных БД нет (в кластере только `postgres`, `sneaker_shop`,
   `template0`, `template1`).
 * API: две точки входа.
-  `app.store_main:app` (он же `app.main:app`) — **результат M3 + шаг M4**,
-  версия `0.6.0`: чтение каталога, регистрация/вход/JWT, запись каталога
+  `app.store_main:app` (он же `app.main:app`) — **результат M3 + шаги M4**,
+  версия `0.7.0`: чтение каталога, регистрация/вход/JWT, запись каталога
   (`POST /products`, `PUT /products/{id}`, `DELETE /products/{id}`) под
-  `require_admin` и корзина пользователя (`POST /cart/items`) под обычной
-  аутентификацией.
+  `require_admin` и корзина пользователя (`POST /cart/items`, `GET /cart`)
+  под обычной аутентификацией.
   `app.catalog_main:app` — **контрольная точка M2**, версия `0.2.0`:
   те же чтение и auth, но маршрутов записи каталога нет (405), а корзины
   нет вовсе (404 — маршрут не зарегистрирован).
@@ -83,9 +84,10 @@ app/database.py         один Engine, фабрика Session, ping() с SELEC
 app/main.py             FastAPI + GET /health + lifespan; подключает роутеры каталога и auth,
                         плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
-app/schemas/cart.py     CartItemAdd (вход: product_size_id + quantity, StrictInt 1..2147483647, extra=forbid)
-                        и CartItemRead (плоский ответ: id, product_size_id, product_id, name, size,
-                        price, quantity, stock, subtotal; Decimal -> строка)
+app/schemas/cart.py     CartItemAdd (вход: product_size_id + quantity, StrictInt 1..2147483647, extra=forbid),
+                        CartItemRead (плоский ответ: id, product_size_id, product_id, name, size,
+                        price, quantity, stock, subtotal; Decimal -> строка) и CartRead
+                        (items + estimated_total — ориентировочная сумма)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
 app/core/security.py    пароли: CryptContext(bcrypt, rounds=12, truncate_error), validate_password,
                         hash_password, verify_password, dummy_hash (для входа без утечки по времени);
@@ -98,14 +100,17 @@ app/services/catalog.py чтение и запись: ProductFilters, list_brand
 app/services/shop.py    корзина (M4): new_session() — СВЕЖАЯ сессия на операцию, add_cart_item
                         (замок владельца -> замок размера -> поиск пары -> проверка int4 и stock -> commit),
                         _load_cart_item с selectinload(CartItem.product_size -> ProductSize.product),
-                        to_read; ошибки CartItemNotFound/ProductSizeNotFound/CartStockConflict/CartConflict
+                        to_read / _item_read, get_cart + _cart_rows (один SELECT с JOIN sizes и products,
+                        ORDER BY cart_items.id, estimated_total по текущим ценам);
+                        ошибки CartItemNotFound/ProductSizeNotFound/CartStockConflict/CartConflict
 app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
                         authenticate_user (+ InvalidCredentials; dummy_hash для отсутствующего email),
                         get_user_by_id (проверка токена)
 app/routers/catalog.py  HTTP-маршруты каталога (только GET, публичные)
 app/routers/catalog_write.py  POST/PUT/DELETE каталога; весь роутер под dependencies=[Depends(require_admin)]
-app/routers/cart.py     POST /cart/items — корзина САМОГО пользователя (без require_admin),
-                        зависимость get_current_user_id (только id из проверенного токена)
+app/routers/cart.py     POST /cart/items (дельта) и GET /cart (своя корзина) — маршруты САМОГО
+                        пользователя (без require_admin), зависимость get_current_user_id
+                        (только id из проверенного токена; параметра user_id у маршрутов нет)
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
                         HTTPBearer + get_current_user/CurrentUser, get_current_user_id и require_admin/AdminUser
@@ -127,7 +132,9 @@ prompts/                тексты заданий модулей + этот ф
 `_m2_contract_review.py`, `_auth_register_probe.py`, `_auth_login_probe.py`,
 `_jwt_probe.py`, `_auth_guard_probe.py`, `_write_matrix_probe.py`,
 `_m2_checkpoint_probe.py`, `_m3_review_probe.py`, `_cart_service_probe.py`,
-`_cart_items_acceptance.ps1`, `_pg_admin.py`, `check_env.py`, `sql/`.
+`_cart_items_acceptance.ps1`, `_cart_get_service_probe.py`,
+`_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_pg_admin.py`,
+`check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
 
@@ -159,6 +166,33 @@ HTTP POST /cart/items  {"product_size_id": 101, "quantity": 2}
   app/core/errors.py        ShopError -> JSON {"detail": ...} без SQL и имён ограничений
 ```
 
+```
+HTTP GET /cart            (заголовок Authorization, БЕЗ параметров)
+  app/routers/cart.py       CurrentUserId — параметра user_id у маршрута нет
+  app/services/shop.py      new_session()
+    1. SELECT ... FROM users WHERE id = :id FOR UPDATE            (замок владельца)
+    2. SELECT cart_items.*, product_sizes.*, products.*
+         FROM cart_items
+         JOIN product_sizes ON product_sizes.id = cart_items.product_size_id
+         JOIN products      ON products.id      = product_sizes.product_id
+        WHERE cart_items.user_id = :uid ORDER BY cart_items.id    (один запрос, 2 JOIN)
+    3. DTO: items = [CartItemRead], estimated_total = сумма subtotal (Decimal)
+    4. сессия закрывается (COMMIT не нужен: только чтение, в логе ROLLBACK)
+  app/schemas/cart.py       CartRead {items, estimated_total}
+```
+
+**Почему сумма ориентировочная (`estimated_total`), а цена заказа
+фиксируется позже.** Корзина — это намерение, а не покупка: в ней нет ни
+строки `orders`, ни снимка цены. Поэтому `price`, `subtotal` и
+`estimated_total` считаются по ТЕКУЩЕЙ цене `products.price`: администратор
+поменял цену — поменялась и оценка (проверено фактически: 7990.00 → 8990.00,
+сумма 21970.00 → 23970.00 без единой записи в БД). Окончательная сумма
+появляется только при checkout, когда цена записывается снимком в
+`order_items.price_at_purchase` и в `orders.total`; после этого история
+покупки не зависит от будущих изменений каталога. Отсюда же правило:
+`estimated_total` нельзя использовать как обязательство, счёт или отчёт —
+для этого есть оформленный заказ.
+
 **Почему своя сессия.** Зависимость аутентификации (`get_current_user`) уже
 прочитала строку `users` в сессии из `get_session` и тем самым открыла
 транзакцию и снимок данных (READ COMMITTED — снимок на момент первого
@@ -176,10 +210,25 @@ HTTP POST /cart/items  {"product_size_id": 101, "quantity": 2}
 одновременные вставки не могут потерять одну из дельт; `UNIQUE(user_id,
 product_size_id)` остаётся страховкой от дубля пары.
 
+**Замок владельца берётся и на `GET /cart`** — по общему протоколу («сначала
+users FOR UPDATE для всех операций корзины»). Для согласованности самого
+ответа он не обязателен: один SELECT и так берёт единый снимок. Его эффект
+другой — чтение дождётся уже начатой записи этого пользователя и вернёт
+состояние ПОСЛЕ неё. Цена решения: чтение сериализуется с записями того же
+пользователя (и с FK-проверками, которым нужна строка `users`). Если такая
+свежесть не нужна, убирается один вызов `_lock_user` в `get_cart`; ничего
+другого менять не нужно.
+
 **Корзина не резервирует остаток:** `stock` не уменьшается ни на одном шаге
 M4. Проверяется только `quantity <= stock`; списание — задача checkout, где
 остаток перепроверяется под той же блокировкой (`UPDATE ... WHERE stock >=
 :qty`).
+
+**DTO собирается до закрытия сессии.** `get_cart`/`add_cart_item` возвращают
+Pydantic-модели (Decimal/int/str), а не ORM-объекты: роутер закрывает сессию
+сразу после возврата сервиса, и обращение к отсоединённому ORM-объекту дало
+бы `DetachedInstanceError`. Проверено и это: в элементах `CartRead` нет
+`_sa_instance_state`.
 
 ## БД: устройство и правила
 
@@ -274,6 +323,17 @@ powershell -NoProfile -File _catalog_acceptance.ps1
 #     store_main на 8001, регистрирует пользователя, проверяет 200/401/404/409/422,
 #     порядок блокировок в логе сервера и неизменность рабочей БД, потом всё убирает.
 powershell -NoProfile -File _cart_items_acceptance.ps1
+
+# 18) ЧТЕНИЕ КОРЗИНЫ, сервисный уровень (M4, часть 2; создаёт и удаляет СВОЮ временную БД):
+#     пустая корзина ([] и 0.00), две позиции в порядке id, subtotal/estimated_total,
+#     ОДИН JOIN-запрос вместо N+1 (из перехваченного SQL), DTO после закрытия сессии,
+#     ДВА пользователя, смена цены каталога и неизменность снимка order_items
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _cart_get_service_probe.py
+
+# 19) ЧТЕНИЕ КОРЗИНЫ, HTTP-приёмка (M4, часть 2): своя временная БД + store_main на 8001,
+#     два пользователя, ?user_id игнорируется, 401 без токена, смена цены через админский
+#     PUT /products/10 (роль выдаётся SQL через _cart_get_fixtures.py), 405 на POST /cart.
+powershell -NoProfile -File _cart_get_acceptance.ps1
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -533,12 +593,40 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   пары, несуществующий владелец → `ShopError` без строк, схема не
   изменилась (8 таблиц, 7 FK, ревизия `201c8afcccba`), рабочая БД после
   прогона не изменилась (`cart_items=0`, `stock=3`).
+* M4 (часть 2, `GET /cart`): `_cart_get_service_probe.py` →
+  `ALL CART GET SERVICE CHECKS PASSED` (своя временная БД),
+  `_cart_get_acceptance.ps1` → `ALL CART GET HTTP CHECKS PASSED` (store_main
+  на 8001, своя временная БД, два пользователя, уборка). Фактически
+  проверено: пустая корзина → 200 `{"items":[],"estimated_total":"0.00"}`
+  (в JSON именно строка `"0.00"`, не число); у пользователя A две позиции
+  (201×1 и 101×2, добавлены в обратном порядке) приходят в порядке
+  возрастания `cart_items.id`, а не по цене или размеру; `price`/`subtotal`
+  = `"5990.00"`/`"5990.00"` и `"7990.00"`/`"15980.00"`,
+  `estimated_total="21970.00"`; у пользователя B своя корзина
+  (`"7990.00"`, другой id строки), корзина A не изменилась. `?user_id=<чужой>`
+  игнорируется в обе стороны (владелец только из токена), без токена и с
+  мусорным токеном → 401, `POST /cart` → 405. Смена цены каталога через
+  настоящий админский `PUT /products/10` (7990.00 → 8990.00): в корзине
+  появились `price="8990.00"`, `subtotal="17980.00"`, `estimated_total` A
+  стал `"23970.00"`, у B — `"8990.00"`, количество и строки корзины не
+  менялись, остаток остался 3, а уже созданная позиция заказа сохранила
+  снимок `price_at_purchase=7990.00` (корзина — оценка «на сейчас», заказ —
+  история). `estimated_total` — `Decimal`, не float. SQL: ровно два SELECT
+  на запрос (`users ... FOR UPDATE OF users`, затем ОДИН оператор
+  `FROM cart_items JOIN product_sizes JOIN products ... WHERE
+  cart_items.user_id = ... ORDER BY cart_items.id`) — N+1 нет; DTO собирается
+  до закрытия сессии и после закрытия читается, в элементах нет
+  `_sa_instance_state`. Схема не менялась (8 таблиц, 7 FK,
+  `201c8afcccba`), рабочая БД после прогона: `cart_items=0`,
+  `price(10)=7990.00`, временных БД не осталось. Регрессия: `POST`-наборы
+  части 1 (`_cart_service_probe.py`, `_cart_items_acceptance.ps1`)
+  перезапущены после рефакторинга `to_read` → `_item_read` — зелёные.
 
 ## Чего ещё нет
 
-* Корзина умеет ТОЛЬКО добавление (`POST /cart/items`). Просмотра корзины
-  (`GET /cart`), установки абсолютного количества (`PATCH`) и удаления
-  позиции (`DELETE`) ещё нет; checkout (`POST /orders`) не начат.
+* Корзина умеет добавление (`POST /cart/items`) и чтение (`GET /cart`).
+  Установки абсолютного количества (`PATCH`) и удаления позиции (`DELETE`)
+  ещё нет; checkout (`POST /orders`) не начат.
 * Запись каталога подключена и защищена; `require_admin` работает.
   Оформления заказа и связи товара с заказом через API ещё нет.
 * Публичного маршрута назначения администратора нет: роль меняется только
@@ -575,16 +663,18 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Следующий шаг
 
-Остальные операции корзины по заданию ученика: `GET /cart` (своя корзина с
-позициями и суммой), `PATCH /cart/items/{id}` (абсолютное количество;
-`{id}` — id строки cart_items, чужая или отсутствующая → 404), `DELETE
-/cart/items/{id}` → 204. Затем оформление заказа (`POST /orders`) одной
-транзакцией с контролем остатка
+Остальные операции корзины по заданию ученика: `PATCH /cart/items/{id}`
+(абсолютное количество; `{id}` — id строки cart_items, чужая или
+отсутствующая → 404) и `DELETE /cart/items/{id}` → 204. Затем оформление
+заказа (`POST /orders`) одной транзакцией с контролем остатка
 (`UPDATE product_sizes SET stock = stock - :qty WHERE id = :id AND stock >= :qty`)
 и снимком цены в `order_items.price_at_purchase`.
 Напоминание: корзина — маршруты самого пользователя (без `require_admin`),
 но с теми же правилами: свежая сессия на операцию, `user.id` из токена,
-порядок блокировок `users → product_sizes → products`.
+порядок блокировок `users → product_sizes → products`. Для `PATCH`/`DELETE`
+дополнительно нужно решить: проверять ли `stock` при `PATCH` (да, если
+количество увеличивается) и как искать строку — `WHERE cart_items.id = :id
+AND cart_items.user_id = :uid` (чужой id неотличим от отсутствующего → 404).
 
 ## Правила написания приёмочных скриптов (грабли, на которые уже наступали)
 
@@ -642,8 +732,15 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
     кавычки и фигурные скобки переразбираются, тело приходит битым и
     FastAPI отвечает `422 json_invalid`. Тело писать в файл и передавать
     `--data-binary @file`. Скрипты `.ps1` держать ASCII: кириллица без BOM
-    ломает парсер (проверено на `_cart_items_acceptance.ps1`).
-15. **`docker compose exec` из песочницы агента недоступен** (named pipe
+    ломает парсер (проверено на `_cart_items_acceptance.ps1` и повторно на
+    `_cart_get_acceptance.ps1`).
+15. **Питоновский код не держать в here-string внутри `.ps1`**: в
+    PowerShell 5.1 такой блок вместе с кириллицей в том же файле ломает
+    разбор (`Missing closing '}'`, «`from` keyword is not supported»), а
+    передача многострочного кода через `-c` вдобавок превращает CRLF в
+    `\r` и валит Python. Фикстуры вынесены в отдельные `.py`
+    (`_cart_get_fixtures.py`), а `.ps1` вызывает их с явным URL аргументом.
+16. **`docker compose exec` из песочницы агента недоступен** (named pipe
     демона закрыт в режиме `workspace-write`): для служебных
     CREATE/DROP DATABASE HTTP-приёмка использует `_pg_admin.py` (psycopg
     напрямую, реквизиты из `.env`), а не `psql` внутри контейнера.

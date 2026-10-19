@@ -43,7 +43,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.errors import ShopConflict, ShopError, ShopNotFound
 from app.database import SessionLocal
 from app.models import CartItem, Product, ProductSize, User
-from app.schemas.cart import CartItemAdd, CartItemRead
+from app.schemas.cart import CartItemAdd, CartItemRead, CartRead
 
 # SQLSTATE нарушения уникальности в PostgreSQL (как в services/auth.py).
 UNIQUE_VIOLATION = "23505"
@@ -52,6 +52,11 @@ UNIQUE_VIOLATION = "23505"
 # чтобы отличить ожидаемый конфликт «эта пара уже в корзине» от любого
 # другого нарушения целостности: второе маскировать нельзя.
 CART_SIZE_UNIQUE = "uq_cart_size"
+
+# Ноль в денежном масштабе: numeric(10,2) хранит два знака после точки, и
+# пустая корзина должна отдавать "0.00", а не "0" (Decimal("0") ушёл бы в
+# JSON как "0").
+MONEY_ZERO = Decimal("0.00")
 
 # Границы колонки quantity в cart_items: Integer = 32 бита со знаком.
 INT4_MIN = -2147483648
@@ -287,10 +292,103 @@ def _load_cart_item(session: Session, item_id: int) -> CartItem | None:
     return session.execute(stmt).scalar_one_or_none()
 
 
-def to_read(item: CartItem) -> CartItemRead:
-    """Собрать плоский ответ из ORM-объекта (id, товар, размер, subtotal)."""
-    product_size = item.product_size
-    product = product_size.product
+# --- чтение корзины (M4, шаг 2: GET /cart) -------------------------------
+#
+# Отличие от add_cart_item: здесь ничего не пишется, поэтому и commit не
+# нужен — сессия закрывается с ROLLBACK (в логе SQLAlchemy так и видно:
+# BEGIN (implicit) ... ROLLBACK). Блокировка владельца берётся сознательно:
+# протокол корзины единый для всех операций (users FOR UPDATE первым шагом),
+# и чтение не исключение — см. пояснение в get_cart.
+
+
+def _cart_rows(
+    session: Session, user_id: int
+) -> list[tuple[CartItem, ProductSize, Product]]:
+    """Все позиции корзины пользователя с размером и товаром ОДНИМ запросом.
+
+    Здесь именно явный JOIN, а не selectinload (как в add_cart_item):
+    чтение всей корзины — это всегда «каждая позиция нужна вместе с размером
+    и товаром», поэтому JOIN даёт ровно один оператор вместо трёх.
+
+    Три вещи, которые нельзя убрать из этого запроса:
+
+    * `WHERE cart_items.user_id == user_id` — фильтр владельца. Он
+      единственный источник «у кого какая корзина», и user_id приходит из
+      проверенного токена, а не из параметров запроса;
+    * `ORDER BY cart_items.id` — стабильный порядок: без ORDER BY
+      PostgreSQL вправе вернуть строки в любом порядке, и ответ «прыгал» бы
+      между одинаковыми запросами;
+    * INNER JOIN по внешним ключам — позиция без размера или размера без
+      товара невозможна (FK в схеме), поэтому LEFT JOIN здесь не нужен и
+      только скрыл бы битые данные.
+
+    Возвращаем список кортежей (CartItem, ProductSize, Product) — ровно три
+    сущности из SELECT, в том же порядке, как они объявлены в select().
+    """
+    stmt = (
+        select(CartItem, ProductSize, Product)
+        .join(ProductSize, ProductSize.id == CartItem.product_size_id)
+        .join(Product, Product.id == ProductSize.product_id)
+        .where(CartItem.user_id == user_id)
+        .order_by(CartItem.id)
+    )
+    return list(session.execute(stmt).all())
+
+
+def get_cart(session: Session, user_id: int) -> CartRead:
+    """Своя корзина: позиции по возрастанию id и ориентировочная сумма.
+
+    Порядок шагов:
+
+    1. `_lock_user` — заблокировать строку владельца (общий протокол
+       корзины и checkout: users FOR UPDATE идёт первым, потом
+       product_sizes, потом products);
+    2. один SELECT с JOIN размеров и товаров, фильтр по user_id, ORDER BY id;
+    3. собрать DTO (CartItemRead для каждой строки) и посчитать
+       estimated_total прямо в памяти.
+
+    Зачем блокировка на чтении. Формально ответ «позиции + сумма» уже
+    согласован без неё: один SELECT в READ COMMITTED берёт единый снимок,
+    поэтому позиции и цены не могут быть из разных состояний. Блокировка
+    даёт другое — ожидание уже начатых операций этого пользователя: если
+    параллельно идёт "добавление в корзину", GET дождётся его COMMIT и
+    вернёт состояние ПОСЛЕ него, а не «до». Цена этого решения — чтение
+    корзины одного пользователя сериализуется с его же записями (и с
+    FK-проверками, которым нужна строка users). Если такая свежесть не
+    нужна, достаточно убрать один вызов `_lock_user` — остальной код не
+    меняется.
+
+    Цена берётся ТЕКУЩАЯ из products, а не из заказа, поэтому
+    estimated_total — оценка: см. пояснение в docstring CartRead.
+
+    DTO собирается ДО выхода из сессии (роутер закрывает её сразу после
+    возврата). Это не косметика: после закрытия сессии любой ORM-объект
+    отсоединён, и обращение к его незагруженным атрибутам дало бы
+    DetachedInstanceError. CartItemRead/CartRead — обычные Pydantic-модели,
+    в них только Decimal, int и str, поэтому они живут без сессии сколько
+    угодно.
+    """
+    _lock_user(session, user_id)
+
+    items: list[CartItemRead] = []
+    total = MONEY_ZERO
+    for item, product_size, product in _cart_rows(session, user_id):
+        read = _item_read(item, product_size, product)
+        items.append(read)
+        # Оба слагаемых — Decimal с двумя знаками после точки из
+        # numeric(10,2), поэтому сумма точная и float не участвует.
+        total += read.subtotal
+
+    return CartRead(items=items, estimated_total=total)
+
+
+def _item_read(item: CartItem, product_size: ProductSize, product: Product) -> CartItemRead:
+    """Собрать плоский DTO позиции из трёх объектов.
+
+    Одна функция на два способа получить связки: JOIN (чтение корзины) и
+    selectinload (ответ на добавление). Иначе поля пришлось бы перечислять
+    дважды, и они разъехались бы при первом же изменении контракта.
+    """
     return CartItemRead(
         id=item.id,
         product_size_id=product_size.id,
@@ -302,6 +400,11 @@ def to_read(item: CartItem) -> CartItemRead:
         stock=product_size.stock,
         subtotal=_subtotal(item.quantity, product.price),
     )
+
+
+def to_read(item: CartItem) -> CartItemRead:
+    """DTO позиции из ORM-объекта, у которого загружены product_size.product."""
+    return _item_read(item, item.product_size, item.product_size.product)
 
 
 def _subtotal(quantity: int, price: Decimal) -> Decimal:

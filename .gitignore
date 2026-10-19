@@ -30,6 +30,7 @@ _seed_acceptance.ps1
 _catalog_acceptance.ps1
 *_acceptance.ps1
 _pg_admin.py
+_*_fixtures.py
 _logging.json
 sql/
 

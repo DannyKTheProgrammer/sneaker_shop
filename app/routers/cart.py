@@ -1,12 +1,13 @@
-# Корзина (M4, шаг «POST /cart/items»).
+# Корзина (M4: добавление позиции и чтение своей корзины).
 #
 # Этот роутер — про самого пользователя, а не про администратора. Поэтому
 # здесь НЕТ require_admin: корзина принадлежит тому, кто предъявил токен, и
 # администратор не имеет к чужой корзине никаких особых прав. Защита — та
 # же зависимость get_current_user, что и у /auth/me.
 #
-# Владелец берётся ТОЛЬКО из проверенного токена: в теле запроса поля
-# user_id нет (extra="forbid" в CartItemAdd отклонит такую попытку 422).
+# Владелец берётся ТОЛЬКО из проверенного токена: ни в теле запроса
+# (extra="forbid" в CartItemAdd отклонит такую попытку 422), ни в
+# query-параметрах поля user_id нет вовсе.
 #
 # Роутер подключается только там, где разрешена запись (app/store_main.py
 # и app/main.py). Контрольная точка M2 (app/catalog_main.py) его не
@@ -17,7 +18,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 
 from app.routers.auth import get_current_user_id
-from app.schemas.cart import CartItemAdd, CartItemRead
+from app.schemas.cart import CartItemAdd, CartItemRead, CartRead
 from app.services import shop as shop_service
 
 router = APIRouter(prefix="/cart", tags=["cart"])
@@ -26,6 +27,47 @@ router = APIRouter(prefix="/cart", tags=["cart"])
 # ORM-объект принадлежит сессии зависимости и «переезжать» в свежую
 # транзакцию не должен (см. комментарий в app/services/shop.py).
 CurrentUserId = Annotated[int, Depends(get_current_user_id)]
+
+
+@router.get(
+    "",
+    response_model=CartRead,
+    status_code=status.HTTP_200_OK,
+    summary="Своя корзина: позиции и ориентировочная сумма",
+    responses={
+        200: {"description": "Позиции по возрастанию id и estimated_total; пустая корзина — [] и 0.00"},
+        400: {"description": "Пользователь из токена больше не существует"},
+        401: {"description": "Токен отсутствует или недействителен"},
+    },
+)
+def read_cart(user_id: CurrentUserId) -> CartRead:
+    """Вернуть свою корзину: позиции по возрастанию cart_items.id и сумму.
+
+    Владелец берётся только из токена: параметра `user_id` у маршрута нет
+    вовсе, поэтому чужую корзину этим запросом получить нельзя (лишний
+    query-параметр FastAPI просто игнорирует — он не участвует в фильтре).
+
+    Цена и остаток в каждой позиции — ТЕКУЩИЕ, из каталога: `price` из
+    products, `stock` из product_sizes, `subtotal = price * quantity`.
+    `estimated_total` — сумма этих subtotal, то есть оценка на сейчас. Она
+    НЕ фиксируется в БД: изменится цена в каталоге — изменится и оценка.
+    Точная, окончательная сумма появится только при оформлении заказа, где
+    цена записывается снимком в `order_items.price_at_purchase` (история
+    покупок при этом не зависит от будущих изменений каталога).
+
+    Пустая корзина — это 200 с `{"items": [], "estimated_total": "0.00"}`,
+    а не 404: «у вас пока ничего нет» — нормальное состояние, а не ошибка.
+
+    Позиции без обёртки в объект вида {"items": [...]}: массив отдаётся
+    внутри CartRead, потому что рядом лежит сумма. Порядок стабильный
+    (ORDER BY cart_items.id), поэтому клиент может опираться на него при
+    отрисовке списка.
+
+    Сессия открывается заново внутри сервиса и закрывается сразу после
+    возврата: DTO уже собран, ORM-объекты снаружи не живут.
+    """
+    with shop_service.new_session() as session:
+        return shop_service.get_cart(session, user_id)
 
 
 @router.post(
