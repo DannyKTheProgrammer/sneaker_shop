@@ -62,14 +62,14 @@ def _redact_validation_errors(errors: list[dict]) -> list[dict]:
 
 def build_app(*, include_writes: bool) -> FastAPI:
     """Собрать приложение; include_writes=True добавляет маршруты записи."""
-    version = "0.10.0" if include_writes else "0.2.0"
+    version = "0.11.0" if include_writes else "0.2.0"
     description = (
         "Учебный бэкенд магазина кроссовок. M3: чтение каталога, регистрация, "
         "вход с выдачей JWT и запись каталога администратором. "
         "M4: корзина пользователя (POST /cart/items, GET /cart, "
         "PATCH /cart/items/{item_id}, DELETE /cart/items/{item_id}). "
-        "M5: POST /orders создаёт заказ со снимком цен (201). Списание "
-        "остатка, очистка корзины и смена статуса — следующие шаги."
+        "M5: POST /orders создаёт заказ одной транзакцией: снимок цен, "
+        "списание остатка и очистка корзины (201). Смена статуса — следующий шаг."
         if include_writes
         else "Учебный бэкенд магазина кроссовок. M2 (контрольная точка): "
              "только чтение каталога, запись не подключена."

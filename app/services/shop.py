@@ -34,9 +34,11 @@
 #
 # Замки живут до COMMIT или ROLLBACK — то есть ровно одну бизнес-операцию.
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -641,8 +643,63 @@ def _lock_products_for_share(session: Session, product_ids: list[int]) -> dict[i
     return {row.id: row for row in rows}
 
 
+# Стадии для внедрения ошибок в тестах. Это НЕ HTTP-параметр: клиент не может
+# включить hook запросом, в OpenAPI его нет, а по умолчанию он None (никаких
+# ошибок). Тест подменяет `shop._FAULT_HOOK` напрямую и проверяет, что откат
+# возвращает БД в исходное состояние. Оставлен в модуле намеренно: без такой
+# «точки инъекции» атомарность отката пришлось бы проверять только чтением кода.
+_FAULT_HOOK: Callable[[str], None] | None = None
+
+
+def _fault(stage: str) -> None:
+    """Вызвать тестовый hook внедрения ошибки на указанной стадии.
+
+    Стадии: `after_order` (заказ вставлен, позиции ещё нет), `after_first_stock`
+    (остаток первого размера уже уменьшен), `after_clear_cart` (корзина уже
+    очищена, фиксации ещё нет). В обычной работе ничего не делает.
+    """
+    hook = _FAULT_HOOK
+    if hook is not None:
+        hook(stage)
+
+
+@contextmanager
+def _transaction(session: Session) -> Iterator[None]:
+    """Менеджер транзакции checkout: один commit на выходе, rollback на ошибке.
+
+    Зачем отдельный менеджер, а не `session.commit()` в конце функции:
+
+    * commit ровно один и в одном месте — его нельзя случайно вызвать внутри
+      цикла по позициям и зафиксировать половину заказа;
+    * ЛЮБОЕ исключение (409 из проверки, `IntegrityError`, `RuntimeError`,
+      тестовый сбой, `KeyboardInterrupt`) проходит через `rollback`, поэтому
+      заказ, позиции, остатки и очистка корзины откатываются вместе;
+    * `with session.begin()` здесь не подходит: сессия пришла из
+      `new_session()`, но первый же SELECT открывает транзакцию (autobegin), и
+      повторный `begin()` дал бы `InvalidRequestError`.
+    """
+    try:
+        yield
+    except IntegrityError as exc:
+        session.rollback()
+        raise ShopConflict(
+            "Order could not be created because of a concurrent change"
+        ) from exc
+    except BaseException:
+        session.rollback()
+        raise
+    else:
+        try:
+            session.commit()
+        except IntegrityError as exc:  # ошибка может всплыть только на commit
+            session.rollback()
+            raise ShopConflict(
+                "Order could not be created because of a concurrent change"
+            ) from exc
+
+
 def create_order(session: Session, user_id: int) -> OrderRead:
-    """Создать заказ из корзины: проверки, затем записи в ОДНОЙ транзакции.
+    """Оформить заказ: проверки и записи в ОДНОЙ транзакции, один commit.
 
     Порядок (он же протокол блокировок):
 
@@ -659,30 +716,47 @@ def create_order(session: Session, user_id: int) -> OrderRead:
        отказ 409 и в БД не меняется ничего;
     7. посчитать сумму как Decimal по ценам ИЗ БД (не по сумме от клиента и
        не на float) и проверить предел Numeric(12,2);
-    8. ЗАПИСИ: `Order(status='created', total)` → `flush` (получить id) →
-       `OrderItem` на каждую позицию с `quantity` и `price_at_purchase` из
-       заблокированного `Product` → `commit` (одна фиксация на всё);
-    9. собрать DTO до выхода из сессии (после commit объекты не просрочены,
-       потому что `expire_on_commit=False`).
+    8. ЗАПИСИ, все внутри одной транзакции:
+       `Order(status='created', total)` → flush (получить id) →
+       `OrderItem` на каждую позицию (`price_at_purchase` — снимок цены) →
+       `UPDATE product_sizes SET stock = stock - :qty WHERE id = :id AND
+       stock >= :qty` для каждого размера (по возрастанию id) →
+       `DELETE FROM cart_items WHERE user_id = :uid` (только своя корзина) →
+       единственный `commit` на выходе из `_transaction`;
+    9. DTO собирается ПОСЛЕ успешного commit и до закрытия сессии.
 
-    **flush vs commit.** `flush` отправляет накопленные INSERT/UPDATE в
-    текущую транзакцию и получает от PostgreSQL значения по умолчанию
-    (`orders.id` из `RETURNING`, `created_at`). После flush строки уже видны
-    в ЭТОЙ транзакции и `order.id` можно использовать для `order_items`, но
-    другим соединениям они ещё не видны, и всё можно откатить. `commit` —
-    точка фиксации: после него данные видны всем и откатить их уже нельзя.
-    Поэтому flush здесь нужен по делу (id родителя для FK), а не как замена
-    commit: фиксация ровно одна, в конце.
+    **Почему `WHERE stock >= :qty` в UPDATE.** Проверка в шаге 6 сделана под
+    блокировкой, поэтому обычно всё сходится. Условие в самом UPDATE — это
+    последняя страховка: если остаток всё-таки изменился, `rowcount` будет 0,
+    и мы получим 409 с полным откатом, а не отрицательный остаток. Значение
+    `stock >= 0` в БД (CHECK) при этом никогда не нарушается.
 
-    **Почему цена — снимок.** `price_at_purchase` берётся из заблокированного
-    `Product`, то есть это цена на момент оформления. Дальнейшие изменения
-    каталога её не трогают: история заказа не пересчитывается. И наоборот,
-    новый заказ посчитается по новым ценам — это разные заказы.
+    **Чего не гарантируют блокировки.** Они живут до конца этой транзакции.
+    После commit другой заказ может списать остаток, а администратор —
+    изменить цену; на созданный заказ это не влияет, потому что цена в нём —
+    снимок. Замок не «бронирует» товар навсегда.
 
-    **Что пока НЕ делается** (следующий шаг): остаток не списывается
-    (`UPDATE product_sizes SET stock = stock - :qty`), корзина не очищается.
-    Поэтому повторный POST создаст ВТОРОЙ заказ по тем же строкам корзины —
-    это известное временное состояние, а не финальное поведение.
+    **Повторный вызов.** После успешного заказа корзина очищена, поэтому
+    следующий `POST /orders` вернёт 409 `Cart is empty` — без автоматических
+    повторов (outcome неизвестен только при обрыве соединения, и повторять
+    такой checkout автоматически нельзя).
+    """
+    with _transaction(session):
+        order, prepared = _perform_checkout(session, user_id)
+
+    # После commit объекты не просрочены (expire_on_commit=False).
+    if order.created_at is None:  # pragma: no cover - RETURNING заполняет сразу
+        session.refresh(order)
+    return _order_read(order, prepared)
+
+
+def _perform_checkout(
+    session: Session, user_id: int
+) -> tuple[Order, list[tuple[int, Product, int, Decimal]]]:
+    """Тело checkout без менеджера транзакции: проверки, затем записи.
+
+    Возвращает созданный `Order` и `prepared` (id размера, товар, количество,
+    стоимость позиции) — из этого собирается DTO уже после commit.
     """
     _lock_user(session, user_id)
 
@@ -731,9 +805,9 @@ def create_order(session: Session, user_id: int) -> OrderRead:
     # Шаг 8: записи. Статус и сумма — явно: клиент их не присылает.
     order = Order(user_id=user_id, status=ORDER_STATUS_CREATED, total=total)
     session.add(order)
-    # flush, а не commit: нужен order.id для FK в order_items. Пока это лишь
-    # INSERT в ещё не зафиксированной транзакции.
+    # flush, а не commit: нужен order.id для FK в order_items.
     session.flush()
+    _fault("after_order")
 
     for product_size_id, product, quantity, _subtotal_value in prepared:
         session.add(
@@ -745,24 +819,42 @@ def create_order(session: Session, user_id: int) -> OrderRead:
                 price_at_purchase=product.price,
             )
         )
-    # Второй flush отправляет INSERT-ы позиций. Ошибки ограничений всплывут
-    # здесь, до фиксации, и откат вернёт БД в исходное состояние.
+    # Отправляем INSERT-ы позиций до списания остатка: если ограничение не
+    # пройдёт, откат вернёт и заказ, и остатки.
     session.flush()
 
-    try:
-        session.commit()
-    except IntegrityError as exc:
-        # Например, размер удалили между блокировкой и вставкой (FK). Полный
-        # откат: ни заказа, ни позиций. Прочие исключения не маскируем.
-        session.rollback()
-        raise ShopConflict(
-            "Order could not be created because of a concurrent change"
-        ) from exc
+    # Остаток уменьшаем по ВОЗРАСТАНИЮ id (тот же порядок, что у блокировок),
+    # отдельным UPDATE на каждый размер. Коммита внутри цикла нет.
+    first_stock_update = True
+    for product_size_id, _product, quantity, _subtotal_value in sorted(
+        prepared, key=lambda row: row[0]
+    ):
+        result = session.execute(
+            update(ProductSize)
+            .where(ProductSize.id == product_size_id, ProductSize.stock >= quantity)
+            .values(stock=ProductSize.stock - quantity)
+        )
+        if result.rowcount != 1:
+            # Остаток изменился между проверкой и записью (гонка). Полный
+            # откат: ни заказа, ни позиций, ни остатков.
+            raise OrderStockConflict(
+                f"Stock for product size {product_size_id} changed during checkout"
+            )
+        if first_stock_update:
+            _fault("after_first_stock")
+            first_stock_update = False
 
-    # Шаг 9: DTO до закрытия сессии. expire_on_commit=False, поэтому
-    # order.id/status/total/created_at доступны без нового SELECT.
-    if order.created_at is None:  # pragma: no cover - RETURNING заполняет сразу
-        session.refresh(order)
+    # Очищаем ТОЛЬКО свою корзину: user_id из токена, чужие строки не тронуты.
+    session.execute(delete(CartItem).where(CartItem.user_id == user_id))
+    _fault("after_clear_cart")
+
+    return order, prepared
+
+
+def _order_read(
+    order: Order, prepared: list[tuple[int, Product, int, Decimal]]
+) -> OrderRead:
+    """DTO созданного заказа из шапки и подготовленных позиций-снимков."""
     return OrderRead(
         id=order.id,
         status=order.status,
