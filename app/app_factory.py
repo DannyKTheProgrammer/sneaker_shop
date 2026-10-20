@@ -22,6 +22,7 @@ from app.routers.auth import router as auth_router
 from app.routers.cart import router as cart_router
 from app.routers.catalog import router as catalog_router
 from app.routers.catalog_write import router as catalog_write_router
+from app.routers.order import router as order_router
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +62,14 @@ def _redact_validation_errors(errors: list[dict]) -> list[dict]:
 
 def build_app(*, include_writes: bool) -> FastAPI:
     """Собрать приложение; include_writes=True добавляет маршруты записи."""
-    version = "0.8.0" if include_writes else "0.2.0"
+    version = "0.9.0" if include_writes else "0.2.0"
     description = (
         "Учебный бэкенд магазина кроссовок. M3: чтение каталога, регистрация, "
         "вход с выдачей JWT и запись каталога администратором. "
         "M4: корзина пользователя (POST /cart/items, GET /cart, "
-        "PATCH /cart/items/{item_id}, DELETE /cart/items/{item_id})."
+        "PATCH /cart/items/{item_id}, DELETE /cart/items/{item_id}). "
+        "M5: POST /orders — проверка заказа и предпросмотр суммы (заказ пока "
+        "не создаётся, записи появятся на следующем шаге)."
         if include_writes
         else "Учебный бэкенд магазина кроссовок. M2 (контрольная точка): "
              "только чтение каталога, запись не подключена."
@@ -83,6 +86,7 @@ def build_app(*, include_writes: bool) -> FastAPI:
     if include_writes:
         app.include_router(catalog_write_router)
         app.include_router(cart_router)
+        app.include_router(order_router)
 
     @app.exception_handler(ShopError)
     async def handle_shop_error(request: Request, exc: ShopError) -> JSONResponse:

@@ -44,6 +44,7 @@ from app.core.errors import ShopConflict, ShopError, ShopNotFound
 from app.database import SessionLocal
 from app.models import CartItem, Product, ProductSize, User
 from app.schemas.cart import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
+from app.schemas.order import OrderPreviewRead
 
 # SQLSTATE нарушения уникальности в PostgreSQL (как в services/auth.py).
 UNIQUE_VIOLATION = "23505"
@@ -52,6 +53,11 @@ UNIQUE_VIOLATION = "23505"
 # чтобы отличить ожидаемый конфликт «эта пара уже в корзине» от любого
 # другого нарушения целостности: второе маскировать нельзя.
 CART_SIZE_UNIQUE = "uq_cart_size"
+
+# Предел orders.total: колонка Numeric(12,2) — 12 значащих цифр, из них две
+# после точки, значит максимум 9999999999.99. Сумму больше этого PostgreSQL
+# не сохранит, поэтому отказываем заранее и понятным 409, а не 500 из драйвера.
+MAX_ORDER_TOTAL = Decimal("9999999999.99")
 
 # Ноль в денежном масштабе: numeric(10,2) хранит два знака после точки, и
 # пустая корзина должна отдавать "0.00", а не "0" (Decimal("0") ушёл бы в
@@ -85,6 +91,37 @@ class CartConflict(ShopConflict):
     """Гонка на уникальности или иной конфликт целостности (409)."""
 
     detail = "Cart item could not be saved because of a concurrent change"
+
+
+class CartEmptyConflict(ShopConflict):
+    """Оформлять нечего: в корзине нет ни одной позиции (409).
+
+    Не 404: корзина пользователя существует всегда (это его набор строк),
+    просто пуста. И не 400: запрос корректен, состояние данных не позволяет
+    выполнить операцию — это и есть 409.
+    """
+
+    detail = "Cart is empty"
+
+
+class OrderStockConflict(ShopConflict):
+    """Хотя бы одной позиции не хватает на складе (409).
+
+    Проверяется ДО любых записей: если не хватает даже второй позиции,
+    заказ не создаётся и остатки не меняются ни у первой, ни у второй.
+    """
+
+    detail = "Not enough stock for one of the cart items"
+
+
+class OrderTotalConflict(ShopConflict):
+    """Сумма заказа не влезает в Numeric(12,2) (409).
+
+    Максимум — 9999999999.99. Отказ до записей: иначе PostgreSQL отклонил бы
+    INSERT с ошибкой numeric field overflow, и клиент получил бы 500.
+    """
+
+    detail = "Order total exceeds the allowed maximum"
 
 
 def new_session() -> Session:
@@ -541,3 +578,153 @@ def _subtotal(quantity: int, price: Decimal) -> Decimal:
     точности, а результат остаётся Decimal.
     """
     return price * quantity
+
+
+# --- checkout, шаг 1: подготовка заказа (M5) ------------------------------
+#
+# Здесь ТОЛЬКО порядок и проверки. Записей нет ни одной: ни orders, ни
+# order_items, ни списания остатка, ни очистки корзины. Поэтому и функция
+# называется prepare_order, а не create_order, и возвращает предпросмотр.
+# Место, где появятся записи, помечено ниже отдельным блоком.
+#
+# ПРОТОКОЛ БЛОКИРОВОК (общий с корзиной, здесь плюс products):
+#   1. users FOR UPDATE                  — сериализует операции владельца;
+#   2. product_sizes FOR UPDATE          — по возрастанию id;
+#   3. products FOR SHARE                — по возрастанию id.
+# Почему именно в этом порядке: он совпадает с корзиной, поэтому две сессии
+# не могут взяться за одни и те же строки наоборот (иначе deadlock). Все
+# размеры и товары блокируются ДО первой проверки количества, чтобы
+# значения stock/price не изменились между проверкой и будущей записью.
+
+
+def _lock_product_sizes(session: Session, size_ids: list[int]) -> dict[int, ProductSize]:
+    """Заблокировать размеры на запись по ВОЗРАСТАНИЮ id.
+
+    `ORDER BY id` + `FOR UPDATE` задаёт порядок обработки строк, поэтому два
+    заказа с пересекающимся набором размеров блокируются в одном и том же
+    порядке и не образуют цикл ожидания.
+
+    Возвращаем сами строки: stock нужен для проверки, и он гарантированно
+    актуален (прочитан под блокировкой, а не до неё).
+    """
+    ordered = sorted(set(size_ids))
+    rows = session.execute(
+        select(ProductSize)
+        .where(ProductSize.id.in_(ordered))
+        .order_by(ProductSize.id)
+        .with_for_update(of=ProductSize)
+    ).scalars().all()
+    return {row.id: row for row in rows}
+
+
+def _lock_products_for_share(session: Session, product_ids: list[int]) -> dict[int, Product]:
+    """Заблокировать товары в режиме FOR SHARE по возрастанию id.
+
+    FOR SHARE (а не FOR UPDATE) выбран осознанно: цену мы только ЧИТАЕМ, но
+    не хотим, чтобы её поменяли между проверкой и созданием заказа. FOR
+    SHARE не мешает другим читателям и другим FOR SHARE, но конфликтует с
+    UPDATE/DELETE строки products — то есть администратор не сможет изменить
+    цену, пока эта транзакция жива. Заодно это слабее FOR UPDATE: два
+    одновременных заказа не блокируют друг друга на товарах.
+    """
+    ordered = sorted(set(product_ids))
+    rows = session.execute(
+        select(Product)
+        .where(Product.id.in_(ordered))
+        .order_by(Product.id)
+        .with_for_update(of=Product, read=True)
+    ).scalars().all()
+    return {row.id: row for row in rows}
+
+
+def prepare_order(session: Session, user_id: int) -> OrderPreviewRead:
+    """Проверить корзину и посчитать будущий заказ. Записей пока НЕТ.
+
+    Порядок (и он же протокол блокировок):
+
+    1. `_lock_user` — users FOR UPDATE по user.id из токена;
+    2. прочитать состав корзины (id строки, id размера, количество) — это
+       ещё не проверка, а только список того, что нужно заблокировать.
+       Читать до блокировок безопасно: замок владельца не даст никому
+       изменить корзину этого пользователя, пока мы работаем;
+    3. пустая корзина → CartEmptyConflict (409);
+    4. заблокировать ВСЕ размеры корзины (FOR UPDATE, по возрастанию id);
+    5. заблокировать ВСЕ их товары (FOR SHARE, по возрастанию id);
+    6. проверить ВСЕ количества против актуального stock — до любых записей:
+       если не хватает хотя бы одной (пусть даже второй по счёту) позиции,
+       отказ 409 и в БД не меняется ничего;
+    7. посчитать сумму как Decimal по ценам ИЗ БД (не по сумме от клиента и
+       не на float) и проверить предел Numeric(12,2);
+    8. вернуть предпросмотр {items, total}.
+
+    Чего блокировки НЕ гарантируют (важно не путать): они держатся только
+    до конца этой транзакции. После COMMIT следующий заказ может списать
+    остаток, а администратор — изменить цену. Замок даёт согласованность
+    проверки ВНУТРИ транзакции, а не «вечную доступность» товара и не
+    резерв остатка.
+    """
+    _lock_user(session, user_id)
+
+    # Шаг 2: состав корзины (без JOIN — только то, что нужно для блокировок).
+    raw = session.execute(
+        select(CartItem.id, CartItem.product_size_id, CartItem.quantity)
+        .where(CartItem.user_id == user_id)
+        .order_by(CartItem.id)
+    ).all()
+
+    # Шаг 3: пустая корзина — конфликт состояния, а не 404.
+    if not raw:
+        raise CartEmptyConflict()
+
+    # Шаги 4–5: блокировки в детерминированном порядке.
+    sizes = _lock_product_sizes(session, [row[1] for row in raw])
+    products = _lock_products_for_share(
+        session, [size.product_id for size in sizes.values()]
+    )
+
+    # Шаг 6: ВСЕ проверки количеств — до первой записи.
+    items: list[CartItemRead] = []
+    total = MONEY_ZERO
+    for item_id, product_size_id, quantity in raw:
+        size = sizes.get(product_size_id)
+        if size is None:  # pragma: no cover - FK не даёт такого состояния
+            raise ShopError("Cart item refers to a missing product size")
+        if quantity > size.stock:
+            raise OrderStockConflict(
+                f"Not enough stock for product size {product_size_id}: "
+                f"requested {quantity}, available {size.stock}"
+            )
+        product = products[size.product_id]
+        subtotal = _subtotal(quantity, product.price)
+        total += subtotal
+        items.append(
+            CartItemRead(
+                id=item_id,
+                product_size_id=product_size_id,
+                product_id=product.id,
+                name=product.name,
+                size=size.size,
+                price=product.price,
+                quantity=quantity,
+                stock=size.stock,
+                subtotal=subtotal,
+            )
+        )
+
+    # Шаг 7: сумма Decimal из БД и предел Numeric(12,2).
+    if total > MAX_ORDER_TOTAL:
+        raise OrderTotalConflict(
+            f"Order total {total} exceeds the maximum {MAX_ORDER_TOTAL}"
+        )
+
+    # =====================================================================
+    # M5, ШАГ 2: ЗДЕСЬ ПОЯВЯТСЯ ЗАПИСИ (сейчас их нет ни одной).
+    #   INSERT INTO orders (user_id, status, total) VALUES (:uid, 'created', :total)
+    #   INSERT INTO order_items (order_id, product_size_id, quantity, price_at_purchase)
+    #       по одной строке на позицию, price_at_purchase — снимок product.price
+    #   UPDATE product_sizes SET stock = stock - :qty
+    #       WHERE id = :size_id AND stock >= :qty      -- rowcount=0 -> 409
+    #   DELETE FROM cart_items WHERE user_id = :uid     -- корзина очищается
+    # Всё это — в ЭТОЙ ЖЕ транзакции и после всех проверок, один COMMIT.
+    # =====================================================================
+    return OrderPreviewRead(items=items, total=total)
