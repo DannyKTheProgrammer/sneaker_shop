@@ -42,9 +42,9 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import ShopConflict, ShopError, ShopNotFound
 from app.database import SessionLocal
-from app.models import CartItem, Product, ProductSize, User
+from app.models import CartItem, Order, OrderItem, Product, ProductSize, User
 from app.schemas.cart import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
-from app.schemas.order import OrderPreviewRead
+from app.schemas.order import OrderItemRead, OrderRead
 
 # SQLSTATE нарушения уникальности в PostgreSQL (как в services/auth.py).
 UNIQUE_VIOLATION = "23505"
@@ -58,6 +58,10 @@ CART_SIZE_UNIQUE = "uq_cart_size"
 # после точки, значит максимум 9999999999.99. Сумму больше этого PostgreSQL
 # не сохранит, поэтому отказываем заранее и понятным 409, а не 500 из драйвера.
 MAX_ORDER_TOTAL = Decimal("9999999999.99")
+
+# Начальный статус заказа. Значение обязано попадать в CHECK
+# status IN ('created', 'processing', 'completed') из миграции M1.
+ORDER_STATUS_CREATED = "created"
 
 # Ноль в денежном масштабе: numeric(10,2) хранит два знака после точки, и
 # пустая корзина должна отдавать "0.00", а не "0" (Decimal("0") ушёл бы в
@@ -637,10 +641,10 @@ def _lock_products_for_share(session: Session, product_ids: list[int]) -> dict[i
     return {row.id: row for row in rows}
 
 
-def prepare_order(session: Session, user_id: int) -> OrderPreviewRead:
-    """Проверить корзину и посчитать будущий заказ. Записей пока НЕТ.
+def create_order(session: Session, user_id: int) -> OrderRead:
+    """Создать заказ из корзины: проверки, затем записи в ОДНОЙ транзакции.
 
-    Порядок (и он же протокол блокировок):
+    Порядок (он же протокол блокировок):
 
     1. `_lock_user` — users FOR UPDATE по user.id из токена;
     2. прочитать состав корзины (id строки, id размера, количество) — это
@@ -650,18 +654,35 @@ def prepare_order(session: Session, user_id: int) -> OrderPreviewRead:
     3. пустая корзина → CartEmptyConflict (409);
     4. заблокировать ВСЕ размеры корзины (FOR UPDATE, по возрастанию id);
     5. заблокировать ВСЕ их товары (FOR SHARE, по возрастанию id);
-    6. проверить ВСЕ количества против актуального stock — до любых записей:
+    6. проверить ВСЕ количества против актуального stock — ДО любых записей:
        если не хватает хотя бы одной (пусть даже второй по счёту) позиции,
        отказ 409 и в БД не меняется ничего;
     7. посчитать сумму как Decimal по ценам ИЗ БД (не по сумме от клиента и
        не на float) и проверить предел Numeric(12,2);
-    8. вернуть предпросмотр {items, total}.
+    8. ЗАПИСИ: `Order(status='created', total)` → `flush` (получить id) →
+       `OrderItem` на каждую позицию с `quantity` и `price_at_purchase` из
+       заблокированного `Product` → `commit` (одна фиксация на всё);
+    9. собрать DTO до выхода из сессии (после commit объекты не просрочены,
+       потому что `expire_on_commit=False`).
 
-    Чего блокировки НЕ гарантируют (важно не путать): они держатся только
-    до конца этой транзакции. После COMMIT следующий заказ может списать
-    остаток, а администратор — изменить цену. Замок даёт согласованность
-    проверки ВНУТРИ транзакции, а не «вечную доступность» товара и не
-    резерв остатка.
+    **flush vs commit.** `flush` отправляет накопленные INSERT/UPDATE в
+    текущую транзакцию и получает от PostgreSQL значения по умолчанию
+    (`orders.id` из `RETURNING`, `created_at`). После flush строки уже видны
+    в ЭТОЙ транзакции и `order.id` можно использовать для `order_items`, но
+    другим соединениям они ещё не видны, и всё можно откатить. `commit` —
+    точка фиксации: после него данные видны всем и откатить их уже нельзя.
+    Поэтому flush здесь нужен по делу (id родителя для FK), а не как замена
+    commit: фиксация ровно одна, в конце.
+
+    **Почему цена — снимок.** `price_at_purchase` берётся из заблокированного
+    `Product`, то есть это цена на момент оформления. Дальнейшие изменения
+    каталога её не трогают: история заказа не пересчитывается. И наоборот,
+    новый заказ посчитается по новым ценам — это разные заказы.
+
+    **Что пока НЕ делается** (следующий шаг): остаток не списывается
+    (`UPDATE product_sizes SET stock = stock - :qty`), корзина не очищается.
+    Поэтому повторный POST создаст ВТОРОЙ заказ по тем же строкам корзины —
+    это известное временное состояние, а не финальное поведение.
     """
     _lock_user(session, user_id)
 
@@ -683,9 +704,11 @@ def prepare_order(session: Session, user_id: int) -> OrderPreviewRead:
     )
 
     # Шаг 6: ВСЕ проверки количеств — до первой записи.
-    items: list[CartItemRead] = []
+    # В prepared попадает всё нужное для записей и для DTO: id размера,
+    # снимок цены (product.price), количество и стоимость позиции.
+    prepared: list[tuple[int, Product, int, Decimal]] = []
     total = MONEY_ZERO
-    for item_id, product_size_id, quantity in raw:
+    for _item_id, product_size_id, quantity in raw:
         size = sizes.get(product_size_id)
         if size is None:  # pragma: no cover - FK не даёт такого состояния
             raise ShopError("Cart item refers to a missing product size")
@@ -697,19 +720,7 @@ def prepare_order(session: Session, user_id: int) -> OrderPreviewRead:
         product = products[size.product_id]
         subtotal = _subtotal(quantity, product.price)
         total += subtotal
-        items.append(
-            CartItemRead(
-                id=item_id,
-                product_size_id=product_size_id,
-                product_id=product.id,
-                name=product.name,
-                size=size.size,
-                price=product.price,
-                quantity=quantity,
-                stock=size.stock,
-                subtotal=subtotal,
-            )
-        )
+        prepared.append((product_size_id, product, quantity, subtotal))
 
     # Шаг 7: сумма Decimal из БД и предел Numeric(12,2).
     if total > MAX_ORDER_TOTAL:
@@ -717,14 +728,53 @@ def prepare_order(session: Session, user_id: int) -> OrderPreviewRead:
             f"Order total {total} exceeds the maximum {MAX_ORDER_TOTAL}"
         )
 
-    # =====================================================================
-    # M5, ШАГ 2: ЗДЕСЬ ПОЯВЯТСЯ ЗАПИСИ (сейчас их нет ни одной).
-    #   INSERT INTO orders (user_id, status, total) VALUES (:uid, 'created', :total)
-    #   INSERT INTO order_items (order_id, product_size_id, quantity, price_at_purchase)
-    #       по одной строке на позицию, price_at_purchase — снимок product.price
-    #   UPDATE product_sizes SET stock = stock - :qty
-    #       WHERE id = :size_id AND stock >= :qty      -- rowcount=0 -> 409
-    #   DELETE FROM cart_items WHERE user_id = :uid     -- корзина очищается
-    # Всё это — в ЭТОЙ ЖЕ транзакции и после всех проверок, один COMMIT.
-    # =====================================================================
-    return OrderPreviewRead(items=items, total=total)
+    # Шаг 8: записи. Статус и сумма — явно: клиент их не присылает.
+    order = Order(user_id=user_id, status=ORDER_STATUS_CREATED, total=total)
+    session.add(order)
+    # flush, а не commit: нужен order.id для FK в order_items. Пока это лишь
+    # INSERT в ещё не зафиксированной транзакции.
+    session.flush()
+
+    for product_size_id, product, quantity, _subtotal_value in prepared:
+        session.add(
+            OrderItem(
+                order_id=order.id,
+                product_size_id=product_size_id,
+                quantity=quantity,
+                # Снимок цены: именно это значение останется в истории.
+                price_at_purchase=product.price,
+            )
+        )
+    # Второй flush отправляет INSERT-ы позиций. Ошибки ограничений всплывут
+    # здесь, до фиксации, и откат вернёт БД в исходное состояние.
+    session.flush()
+
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        # Например, размер удалили между блокировкой и вставкой (FK). Полный
+        # откат: ни заказа, ни позиций. Прочие исключения не маскируем.
+        session.rollback()
+        raise ShopConflict(
+            "Order could not be created because of a concurrent change"
+        ) from exc
+
+    # Шаг 9: DTO до закрытия сессии. expire_on_commit=False, поэтому
+    # order.id/status/total/created_at доступны без нового SELECT.
+    if order.created_at is None:  # pragma: no cover - RETURNING заполняет сразу
+        session.refresh(order)
+    return OrderRead(
+        id=order.id,
+        status=order.status,
+        total=order.total,
+        created_at=order.created_at,
+        items=[
+            OrderItemRead(
+                product_size_id=product_size_id,
+                quantity=quantity,
+                price_at_purchase=product.price,
+                subtotal=subtotal,
+            )
+            for product_size_id, product, quantity, subtotal in prepared
+        ],
+    )

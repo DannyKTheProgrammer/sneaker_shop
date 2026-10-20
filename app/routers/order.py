@@ -1,13 +1,13 @@
-# Маршруты заказа (M5, шаг 1: только проверка и предпросмотр).
+# Маршруты заказа (M5, шаг 2: POST /orders создаёт заказ).
 #
 # POST /orders — маршрут САМОГО пользователя (как корзина), без
 # require_admin: заказ оформляет тот, кто предъявил токен. Владелец и цены
 # берутся из БД, а не из тела запроса, поэтому тело либо отсутствует, либо
 # пустое: см. OrderCreate (extra="forbid").
 #
-# На этом шаге заказ НЕ создаётся: сервис только блокирует строки, проверяет
-# количества и считает сумму. Записи (orders, order_items, списание stock,
-# очистка корзины) появятся на следующем шаге — место в коде помечено.
+# На этом шаге создаются строки `orders` и `order_items` в одной транзакции.
+# СПИСАНИЕ ОСТАТКА и ОЧИСТКА КОРЗИНЫ — следующий шаг (явно, чтобы не
+# считать текущее поведение финальным).
 #
 # Роутер подключается только там, где разрешена запись (store_main), чтобы
 # контрольная точка M2 осталась «только чтение каталога».
@@ -17,7 +17,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, status
 
 from app.routers.auth import get_current_user_id
-from app.schemas.order import OrderCreate, OrderPreviewRead
+from app.schemas.order import OrderCreate, OrderRead
 from app.services import shop as shop_service
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -27,11 +27,11 @@ CurrentUserId = Annotated[int, Depends(get_current_user_id)]
 
 @router.post(
     "",
-    response_model=OrderPreviewRead,
-    status_code=status.HTTP_200_OK,
-    summary="Проверить заказ (предпросмотр, заказ пока не создаётся)",
+    response_model=OrderRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Создать заказ из корзины (снимок цен)",
     responses={
-        200: {"description": "Позиции и сумма по данным БД; заказ НЕ создан"},
+        201: {"description": "Заказ создан: id, status, total, created_at, позиции-снимки"},
         401: {"description": "Токен отсутствует или недействителен"},
         409: {"description": "Корзина пуста / не хватает остатка / сумма больше предела Numeric(12,2)"},
         422: {"description": "В теле есть поля (user_id, total, _test_hook, ...) или тело не JSON"},
@@ -40,8 +40,8 @@ CurrentUserId = Annotated[int, Depends(get_current_user_id)]
 def create_order(
     user_id: CurrentUserId,
     payload: Annotated[OrderCreate | None, Body(description="Тело необязательно; допустимо только {}")] = None,
-) -> OrderPreviewRead:
-    """Проверить корзину и показать будущий заказ.
+) -> OrderRead:
+    """Создать заказ из своей корзины.
 
     Тело запроса: отсутствует или `{}`. `payload` не участвует в расчётах —
     он существует ровно для того, чтобы Pydantic отверг любое присланное
@@ -60,17 +60,26 @@ def create_order(
        любой позиции → 409 и в БД не меняется ничего;
     7. сумма считается как Decimal по ценам из БД, проверяется предел
        Numeric(12,2) = 9999999999.99;
-    8. возвращаются позиции и сумма.
+    8. `Order(status='created', total)` → `flush` (получить id) →
+       `OrderItem` на каждую позицию с `quantity` и `price_at_purchase` из
+       заблокированного Product → один `commit`;
+    9. DTO собирается до закрытия сессии.
 
-    Записей пока нет: заказ не создан, остаток не списан, корзина не
-    очищена. Ответ — предпросмотр, а не подтверждение покупки.
+    Ответ `201` и тело `OrderRead`: позиции содержат СНИМОК цены
+    (`price_at_purchase`) и количество; `subtotal` считается из них.
+    Названия товара в истории нет — в схеме у order_items нет такой
+    колонки (появится только с миграцией, если понадобится).
+
+    Чего пока нет: остаток НЕ списывается, корзина НЕ очищается. Поэтому
+    повторный POST создаст второй заказ по тем же строкам — это временное
+    состояние до следующего шага, а не финальное поведение.
 
     Блокировки не «бронируют» товар: они держатся до конца транзакции.
     После неё другой заказ может списать остаток, а администратор —
-    изменить цену. Гарантия здесь только одна: проверка и (на следующем
-    шаге) запись не разъедутся из-за параллельного изменения.
+    изменить цену; на уже созданный заказ это не влияет, потому что в нём
+    лежит снимок цены.
     """
     # Тело намеренно не используется: контракт — «ничего не прислать».
     _ = payload
     with shop_service.new_session() as session:
-        return shop_service.prepare_order(session, user_id)
+        return shop_service.create_order(session, user_id)

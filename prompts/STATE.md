@@ -5,18 +5,22 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M5, часть 1
-— `POST /orders` в режиме «только проверки»: пустое тело ({} или ничего),
-блокировки `users` → `product_sizes` → `products FOR SHARE`, отказ на пустой
-корзине (409), проверка ВСЕХ количеств до записей, сумма Decimal по ценам БД
-с пределом Numeric(12,2), предпросмотр без записей. Записей нет ни одной:
-место помечено в коде. Все наборы M4 перезапущены — зелёные.
+Обновляется после каждого значимого шага. Последнее обновление: M5, часть 2
+— `POST /orders` СОЗДАЁТ заказ: после проверок `Order(status='created',
+total)` → `flush` (получить id) → `OrderItem` на каждую позицию со снимком
+цены → один `commit`. Ответ `201 OrderRead`. Проверено: 101×2 + 201×1 =
+`21970.00`; после изменения цены каталога история хранит `7990.00` и прежний
+`total`; flush виден только своей транзакции, commit — всем. Остаток пока НЕ
+списывается, корзина НЕ очищается (следующий шаг).
+
+Инфраструктура: Docker Desktop должен быть запущен — без него PostgreSQL на
+`127.0.0.1:55433` недоступен, и проверить ничего нельзя (в этой части так и
+случилось: пришлось ждать, пока ученик запустит Docker).
 
 Данные ученика в рабочей БД: `users` — три строки (`danny@gmail.com`,
 `admin@example.com` и `danny@gmail.comm`, созданная вручную в его
-приложении на 8000). На момент записи `cart_items` в рабочей БД пуст:
-ученик удалил свою тестовую строку сам. Его данные не удалять и не считать
-мусором проверок.
+приложении на 8000). `cart_items` пуст; `orders=0`, `order_items=0`. Его
+данные не удалять и не считать мусором проверок.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -57,11 +61,11 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
   `template0`, `template1`).
 * API: две точки входа.
   `app.store_main:app` (он же `app.main:app`) — **результат M3 + шаги M4**,
-  версия `0.9.0`: чтение каталога, регистрация/вход/JWT, запись каталога
+  версия `0.10.0`: чтение каталога, регистрация/вход/JWT, запись каталога
   (`POST /products`, `PUT /products/{id}`, `DELETE /products/{id}`) под
   `require_admin`, корзина пользователя (`POST /cart/items`, `GET /cart`,
   `PATCH /cart/items/{item_id}`, `DELETE /cart/items/{item_id}`) и
-  `POST /orders` (предпросмотр: проверки и сумма, БЕЗ записей) под обычной
+  `POST /orders` (создаёт заказ со снимком цен, `201`) под обычной
   аутентификацией.
   `app.catalog_main:app` — **контрольная точка M2**, версия `0.2.0`:
   те же чтение и auth, но маршрутов записи каталога нет (405), а корзины
@@ -101,8 +105,9 @@ app/schemas/cart.py     CartItemAdd (вход: product_size_id + quantity, Stric
                         CartItemRead (плоский ответ: id, product_size_id, product_id, name, size,
                         price, quantity, stock, subtotal; Decimal -> строка) и CartRead
                         (items + estimated_total — ориентировочная сумма)
-app/schemas/order.py    OrderCreate (ПУСТАЯ модель, extra=forbid: тело {} или ничего, любое поле -> 422)
-                        и OrderPreviewRead (items + total — предпросмотр, заказ пока не создаётся)
+app/schemas/order.py    OrderCreate (ПУСТАЯ модель, extra=forbid: тело {} или ничего, любое поле -> 422),
+                        OrderItemRead (product_size_id, quantity, price_at_purchase-снимок, subtotal)
+                        и OrderRead (id, status, total, created_at, items)
 app/schemas/query.py    параметры запроса GET /products: ProductFilters + типы Money/SizeValue/Limit/Offset/Search
 app/core/security.py    пароли: CryptContext(bcrypt, rounds=12, truncate_error), validate_password,
                         hash_password, verify_password, dummy_hash (для входа без утечки по времени);
@@ -119,10 +124,12 @@ app/services/shop.py    корзина (M4): new_session() — СВЕЖАЯ се
                         ORDER BY cart_items.id, estimated_total по текущим ценам),
                         _get_owned_item (ОДИН SELECT: cart_items.id AND cart_items.user_id),
                         update_cart_item (абсолютное quantity, проверка stock), delete_cart_item;
-                        checkout, шаг 1 (M5): prepare_order — users FOR UPDATE -> состав корзины ->
+                        checkout (M5): create_order — users FOR UPDATE -> состав корзины ->
                         product_sizes FOR UPDATE (ORDER BY id) -> products FOR SHARE (ORDER BY id) ->
-                        ВСЕ проверки stock -> сумма Decimal и предел MAX_ORDER_TOTAL=9999999999.99;
-                        записи ещё не делаются (место помечено в коде);
+                        ВСЕ проверки stock -> сумма Decimal и предел MAX_ORDER_TOTAL=9999999999.99 ->
+                        Order(status='created', total) + flush -> OrderItem(price_at_purchase-снимок)
+                        + flush -> один commit; DTO собирается до закрытия сессии;
+                        пока НЕ списывает stock и НЕ очищает корзину (следующий шаг);
                         ошибки CartItemNotFound/ProductSizeNotFound/CartStockConflict/CartConflict,
                         CartEmptyConflict/OrderStockConflict/OrderTotalConflict (все 409)
 app/services/auth.py    register_user (+ EmailAlreadyRegistered, разбор IntegrityError 23505),
@@ -135,9 +142,10 @@ app/routers/cart.py     POST /cart/items (дельта), GET /cart, PATCH /cart/
                         (без require_admin), зависимость get_current_user_id (только id из проверенного
                         токена; параметра user_id нет, а ItemId = Path(ge=1, le=2147483647) отсекает
                         нечисловой/нулевой id как 422)
-app/routers/order.py    POST /orders — предпросмотр заказа (200 + OrderPreviewRead), маршрут САМОГО
+app/routers/order.py    POST /orders — СОЗДАЁТ заказ (201 + OrderRead), маршрут САМОГО
                         пользователя (без require_admin), тело необязательно (OrderCreate | None),
-                        текущие 409: Cart is empty / Not enough stock / Order total exceeds maximum
+                        409: Cart is empty / Not enough stock / Order total exceeds maximum;
+                        пока не списывает остаток и не очищает корзину (следующий шаг)
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
                         HTTPBearer + get_current_user/CurrentUser, get_current_user_id и require_admin/AdminUser
@@ -162,7 +170,7 @@ prompts/                тексты заданий модулей + этот ф
 `_cart_items_acceptance.ps1`, `_cart_get_service_probe.py`,
 `_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_cart_isolation_probe.py`,
 `_cart_patch_delete_probe.py`, `_cart_duplicate_probe.py`, `_m4_review_probe.py`,
-`_orders_prepare_probe.py`,
+`_orders_create_probe.py`,
 `_pg_admin.py`,
 `check_env.py`, `sql/`.
 
@@ -233,7 +241,7 @@ HTTP DELETE /cart/items/{item_id}                        (204, тело пуст
 ```
 HTTP POST /orders        (тело отсутствует или {}; иначе 422)
   app/routers/order.py      OrderCreate (=None если тела нет): ни одного поля
-  app/services/shop.py      prepare_order(session, user_id)  — новая сессия
+  app/services/shop.py      create_order(session, user_id)  — новая сессия
     1. SELECT ... FROM users WHERE id = :id FOR UPDATE                    (замок владельца)
     2. SELECT id, product_size_id, quantity FROM cart_items
          WHERE user_id = :uid ORDER BY id                                 (состав корзины)
@@ -244,12 +252,24 @@ HTTP POST /orders        (тело отсутствует или {}; иначе 
        не хватает любой (даже второй) -> OrderStockConflict (409), БД не меняется
     6. total = Σ price * quantity (Decimal из БД); total > 9999999999.99
        -> OrderTotalConflict (409)
-    7. ---- M5, ШАГ 2: ЗДЕСЬ БУДУТ ЗАПИСИ (сейчас их нет) ----
-       INSERT orders; INSERT order_items(price_at_purchase); UPDATE product_sizes
-       SET stock = stock - :qty WHERE id = :id AND stock >= :qty; DELETE cart_items;
-       всё в этой же транзакции, один COMMIT
-    8. ответ 200 OrderPreviewRead {items, total} — предпросмотр, заказ НЕ создан
+    7. ЗАПИСИ в этой же транзакции:
+       INSERT INTO orders (user_id, status='created', total) RETURNING id, created_at  (flush)
+       INSERT INTO order_items (order_id, product_size_id, quantity, price_at_purchase)
+           — по строке на позицию, price_at_purchase = product.price (снимок)
+       один COMMIT
+    8. ответ 201 OrderRead {id, status, total, created_at, items[снимки]}
+       DTO собирается до закрытия сессии (expire_on_commit=False)
+    СЛЕДУЮЩИЙ ШАГ: UPDATE product_sizes SET stock = stock - :qty
+    WHERE id = :id AND stock >= :qty (rowcount=0 -> 409) и DELETE cart_items
 ```
+
+**flush и commit — разные вещи.** `flush` отправляет INSERT-ы в текущую
+транзакцию и забирает `id`/`created_at` из PostgreSQL (`RETURNING`), после
+чего `order.id` можно использовать в FK `order_items`; но другие соединения
+строк ещё не видят, и всё можно откатить. `commit` фиксирует: данные видны
+всем, откат невозможен. В коде flush — инструмент (нужен id), commit — один,
+в конце. Проверено отдельным опытом: после flush `SELECT` из другого
+соединения даёт 0 строк, после commit — 1.
 
 **Что именно гарантируют блокировки checkout и что нет.** `product_sizes
 FOR UPDATE` не даёт списать остаток этой же пары из другой транзакции, пока
@@ -464,15 +484,16 @@ powershell -NoProfile -File _cart_get_acceptance.ps1
 #     устаревшие комментарии), схема и ревизия.
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _m4_review_probe.py
 
-# 24) POST /ORDERS — ТОЛЬКО ПРОВЕРКИ (M5, часть 1): своя временная БД + сервер 8001.
+# 24) POST /ORDERS — СОЗДАНИЕ ЗАКАЗА (M5, часть 2): своя временная БД + сервер 8001.
 #     Тело необязательно ({} или ничего), лишние user_id/total/_test_hook/items -> 422,
-#     401 без токена, 405 на PUT; пустая корзина -> 409; предпросмотр 200 с суммой
-#     Decimal по ценам БД; нехватка ВТОРОЙ позиции -> 409 и все строки без изменений;
-#     предел Numeric(12,2) 9999999999.99 (выше -> 409, ровно на пределе -> 200);
-#     порядок блокировок из реального SQL (users -> состав корзины -> sizes FOR UPDATE
-#     -> products FOR SHARE) и НИ ОДНОЙ записи; FOR SHARE держит цену, FOR UPDATE
-#     держит остаток, обычное чтение проходит, после транзакции замки снимаются.
-.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _orders_prepare_probe.py
+#     401 без токена; корзина 101x2 + 201x1 -> 201, total "21970.00", позиции-снимки;
+#     в БД одна orders (status created, total, created_at) и две order_items;
+#     flush виден только своей транзакции, commit — всем; после изменения цены
+#     каталога старый заказ хранит 7990.00 и прежний total, новый считается по новой
+#     цене; порядок users FOR UPDATE -> cart_items -> sizes FOR UPDATE -> products
+#     FOR SHARE -> INSERT orders -> INSERT order_items и ни одного UPDATE/DELETE;
+#     отказы (нехватка, предел Numeric(12,2), пустая корзина) не создают строк.
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _orders_create_probe.py
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -859,27 +880,31 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   коды; (3) `IntegrityError` в `update_cart_item` пробрасывается как 500 —
   схема его не допускает (`ge=1`), но при будущем изменении CHECK стоит
   отдать 409.
-* M5 (часть 1, `POST /orders` — только проверки): `_orders_prepare_probe.py`
-  → `ALL ORDER PREPARE CHECKS PASSED` (своя временная БД, сервер 8001, без
-  токенов в отчёте). Фактически: без тела и с `{}` запрос принимается и
-  упирается в пустую корзину — `409 {"detail":"Cart is empty"}` (не 422);
-  `{"user_id":1}`, `{"total":"1.00"}`, `{"_test_hook":true}`, `{"items":[]}`
-  → `422 extra_forbidden`; `PUT /orders` → 405; без токена → 401. Корзина
-  101×2 + 201×3 → предпросмотр 200, `total="33950.00"`, subtotal-ы
-  `"15980.00"`/`"17970.00"`, и после запроса корзина, остатки, `orders`,
-  `order_items` не изменились (записей нет). Внешнее изменение остатка
-  второй позиции (201 → 1) → `409 Not enough stock for product size 201:
-  requested 3, available 1`, при этом не тронута даже первая позиция
-  (`stock 101 = 3`). Предел: товар с ценой 99999999.99 × 100 =
-  `9999999999.00` вместе с обычными позициями даёт `10000033949.00` → 409
-  с названным пределом; ровно `9999999999.00` → 200. Порядок операторов из
-  реального SQL: `users FOR UPDATE` → `cart_items` (состав) →
-  `product_sizes ... ORDER BY product_sizes.id FOR UPDATE` →
-  `products ... ORDER BY products.id FOR SHARE`; ни одного
-  INSERT/UPDATE/DELETE; `total` — `Decimal`. Пока транзакция жива: `UPDATE
-  products SET price` → lock timeout, `UPDATE product_sizes SET stock` →
-  lock timeout, обычный `SELECT price` проходит; после закрытия транзакции
-  обе записи проходят (замок ≠ бронь). Все наборы M4 перезапущены —
+* M5 (часть 2, `POST /orders` создаёт заказ): `_orders_create_probe.py` →
+  `ALL ORDER CREATE CHECKS PASSED` (своя временная БД, сервер 8001, без
+  токенов в отчёте). Фактически: без тела и с `{}` запрос принимается
+  (пустая корзина → `409 Cart is empty`), `{"user_id":1}`, `{"total":"1.00"}`,
+  `{"_test_hook":true}`, `{"items":[]}` → 422, без токена → 401. Корзина
+  101×2 + 201×1 → `201`, тело `{id, status, total, created_at, items}`,
+  `total="21970.00"` (2·7990 + 1·5990), позиции `price_at_purchase`
+  `"7990.00"`/`"5990.00"` и `subtotal` `"15980.00"`/`"5990.00"`,
+  `created_at` — свежее серверное время. В БД: одна `orders`
+  (`user_id` из токена, `status='created'`, `total='21970.00'`,
+  `created_at` заполнен) и две `order_items`;
+  `sum(quantity*price_at_purchase) = orders.total`. После изменения цены
+  товара 10 на 8990.00 старый заказ хранит `total='21970.00'` и
+  `price_at_purchase='7990.00'`, каталог показывает 8990.00, а НОВЫЙ заказ
+  считается по новой цене (`23970.00`, снимок `8990.00`); в БД два разных
+  заказа с разными total. `flush` vs `commit` проверен отдельно: после
+  flush другое соединение строку не видит (0), после commit — видит (1).
+  Порядок из реального SQL: `users FOR UPDATE` → `cart_items` (состав) →
+  `product_sizes … ORDER BY id FOR UPDATE` → `products … ORDER BY id FOR
+  SHARE` → `INSERT INTO orders … RETURNING` → `INSERT INTO order_items`;
+  ровно один `after_commit`, ни одного `UPDATE`/`DELETE` — остаток и
+  корзина не тронуты (`stock` 101=3/102=0/201=5/301=2, `cart_items` целы).
+  Отказы (нехватка остатка 201→0, сумма больше `Numeric(12,2)`, пустая
+  корзина) → 409 и НИ ОДНОЙ строки заказа. Схема не менялась: 8 таблиц,
+  7 FK, 4 UNIQUE, ревизия `201c8afcccba`. Все наборы M4 перезапущены —
   зелёные; рабочая БД не менялась.
 
 ## Чего ещё нет
@@ -887,10 +912,15 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 * Корзина готова целиком и **принята ревью** (часть 6): добавление
   (`POST /cart/items`), чтение (`GET /cart`), абсолютное количество
   (`PATCH /cart/items/{item_id}`), удаление (`DELETE /cart/items/{item_id}`).
-* `POST /orders` пока **только проверяет**: заказ не создаётся, остаток не
-  списывается, корзина не очищается. Записи (и `201` с `OrderRead`),
-  смена статуса заказа (`PATCH /orders/{id}/status`, `403` неадминистратору)
-  и списание остатка — следующий шаг.
+* `POST /orders` **создаёт** заказ (`201`, `OrderRead` со снимками цен).
+  Пока НЕ списывает остаток (`UPDATE product_sizes SET stock = stock - :qty`)
+  и НЕ очищает корзину — поэтому повторный POST создаст ВТОРОЙ заказ по тем
+  же строкам; смена статуса (`PATCH /orders/{id}/status`, `403`
+  неадминистратору) тоже не сделана. Это следующий шаг.
+* Название товара в истории заказа не хранится: в `order_items` нет колонки
+  `name` (только `product_size_id`, `quantity`, `price_at_purchase`).
+  Если понадобится — отдельная миграция; в DTO заказа «текущее» имя не
+  подставляется, чтобы не выдавать его за историю.
 * Запись каталога подключена и защищена; `require_admin` работает.
   Оформления заказа и связи товара с заказом через API ещё нет.
 * Публичного маршрута назначения администратора нет: роль меняется только
@@ -913,10 +943,13 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   страниц не гарантирован при параллельных вставках/удалениях
   (keyset-пагинация — отдельная задача).
 * Корзины (кроме добавления), оформления заказа — нет. Регистрация и JWT
-  сделаны в M3.
+  сделаны в M3. (**Устарело для M4/M5**: корзина и создание заказа уже
+  есть; строка оставлена как след истории — актуально см. «Чего ещё нет»
+  выше.)
 * Каскадного удаления и обработчиков покупки нет намеренно.
-* Не проверялись: конкурентное списание остатка, гонка при оформлении,
-  `ON DELETE` на практике, `alembic downgrade` в последнем прогоне.
+* Не проверялись: конкурентное списание остатка, гонка при оформлении
+  (`POST /orders` сейчас не списывает stock, поэтому гонки за остаток ещё
+  не возникает), `ON DELETE` на практике, `alembic downgrade`.
 * В этом шаге НЕ перезапускались наборы M3 (`_write_matrix_probe.py`,
   `_m2_contract_review.py`, `_m3_review_probe.py`) и `_auth_*`: изменения
   M4 к ним не относятся (правки ровно в `app/app_factory.py` — новый
@@ -931,19 +964,22 @@ Checkout начат частично: **часть 1** (`POST /orders` — пр�
 предпросмотр) сделана, записи — следующий шаг. Ниже — что уже гарантировано
 и что осталось решить.
 
-**Сделано в части 1 (опираться на это)**
+**Сделано в части 1–2 (опираться на это)**
 
 * `app/schemas/order.py`: `OrderCreate` (пустая модель, `extra="forbid"`),
-  `OrderPreviewRead {items, total}`.
-* `app/routers/order.py`: `POST /orders`, 200, тело необязательно
+  `OrderItemRead` (product_size_id, quantity, price_at_purchase, subtotal),
+  `OrderRead` (id, status, total, created_at, items).
+* `app/routers/order.py`: `POST /orders`, **201**, тело необязательно
   (`OrderCreate | None` в `Body`), защиты: 401 без токена, 422 на любое поле.
-* `app/services/shop.py`: `prepare_order` — `_lock_user` → состав корзины →
+* `app/services/shop.py`: `create_order` — `_lock_user` → состав корзины →
   `_lock_product_sizes` (FOR UPDATE, `ORDER BY id`) →
   `_lock_products_for_share` (FOR SHARE, `ORDER BY id`) → все проверки →
-  сумма `Decimal` и `MAX_ORDER_TOTAL = 9999999999.99`; пустая корзина,
-  нехватка и превышение дают 409 (`CartEmptyConflict`,
-  `OrderStockConflict`, `OrderTotalConflict`).
-* Проверено `_orders_prepare_probe.py` (см. раздел «Что уже проверено»).
+  сумма `Decimal` и `MAX_ORDER_TOTAL = 9999999999.99` →
+  `Order(status='created', total)` + `flush` → `OrderItem` со снимком
+  `price_at_purchase` + `flush` → один `commit`; пустая корзина, нехватка и
+  превышение дают 409 (`CartEmptyConflict`, `OrderStockConflict`,
+  `OrderTotalConflict`).
+* Проверено `_orders_create_probe.py` (см. раздел «Что уже проверено»).
 
 **Что готово и на что опираться**
 
@@ -984,26 +1020,25 @@ Checkout начат частично: **часть 1** (`POST /orders` — пр�
 
 **Решения, которые нужно принять до кода (открытые вопросы)**
 
-* Пустая корзина: **решено в части 1** — `409 Cart is empty` (состояние не
-  позволяет операцию; проверено фактически).
-* Что делать, если в корзине количество больше остатка: **решено в части 1**
-  — `409` на конкретную позицию с числами (`requested N, available M`) и
+* Пустая корзина: **решено** — `409 Cart is empty` (проверено фактически).
+* Что делать, если в корзине количество больше остатка: **решено** —
+  `409` на конкретную позицию с числами (`requested N, available M`) и
   ничего не менять; проверено на ВТОРОЙ позиции (первая тоже не тронута).
-* Порядок списания при нескольких позициях: по возрастанию
-  `product_sizes.id` (совпадает с порядком блокировок; в части 1 блокировки
-  уже идут `ORDER BY id`).
-* Ответ на создание заказа: `201` + `OrderRead` (id, status, total, items)
-  или `200`? Пока (часть 1) ответ — `200` + `OrderPreviewRead`; при записях
-  предлагается `201`.
-* Кто и как меняет статус: отдельный маршрут `PATCH /orders/{id}/status`
-  под `require_admin`; неадминистратор → `403`; допустимые значения — из
-  `CHECK`; чужой/несуществующий заказ → `404`; пользователь свой статус
-  менять не может.
-* Нужно решить: очищать корзину в той же транзакции (предлагается да) и что
-  делать при повторном checkout после успешного (корзина пуста → `409
-  Cart is empty`, авторетраев нет).
+* Предел суммы: **решено** — `MAX_ORDER_TOTAL = 9999999999.99`
+  (`Numeric(12,2)`), выше → `409`, ничего не пишется.
+* Ответ на создание заказа: **решено** — `201` + `OrderRead`
+  (id, status, total, created_at, items-снимки).
+* Формат позиции истории: **решено** — `product_size_id`, `quantity`,
+  `price_at_purchase` (снимок), `subtotal`; имени товара в истории нет,
+  потому что в `order_items` нет такой колонки.
+* Осталось решить/сделать (следующий шаг): списание остатка
+  (`UPDATE ... WHERE stock >= :qty`, `rowcount=0` → 409) и очистка корзины
+  в той же транзакции; повторный checkout после успешного (корзина пуста →
+  `409 Cart is empty`, авторетраев нет); `PATCH /orders/{id}/status` под
+  `require_admin` (`403` неадминистратору, `404` чужой/несуществующий,
+  `422` недопустимый статус).
 
-**Что понадобится для проверки M5 (шаг 2)**
+**Что понадобится для проверки M5 (шаг 3 — списание и статус)**
 
 * Seed: size101 stock3/7990.00, size102 stock0, size201 stock5/5990.00,
   size301 stock2/9990.00.
@@ -1015,9 +1050,15 @@ Checkout начат частично: **часть 1** (`POST /orders` — пр�
 * Наблюдения после каждого отказа: `orders=0`, `order_items=0`,
   `cart_items` не изменились, `stock` не изменился.
 * Не забыть: `orders.total` ограничен `Numeric(12,2)` →
-  `MAX_ORDER_TOTAL = 9999999999.99` уже проверяется в части 1.
+  `MAX_ORDER_TOTAL = 9999999999.99`; в части 2 проверено, что снимок цены
+  не зависит от последующих изменений каталога, и что `flush` ≠ `commit`.
 
-
+**Правило для проверок по исходникам** (добавлено после ложного срабатывания
+в части 2): сравнивать надо ИСПОЛНЯЕМЫЙ код, без комментариев и докстрингов.
+`shop.py` теперь содержит `UPDATE product_sizes …` в докстринге про
+следующий шаг, и наивная проверка «в сервисе корзины нет UPDATE stock»
+упала. В `_m4_review_probe.py` функция `code_only()` вырезает и `#`-строки,
+и `"""…"""`-блоки.
 
 ## Правила написания приёмочных скриптов (грабли, на которые уже наступали)
 
@@ -1122,7 +1163,8 @@ Checkout начат частично: **часть 1** (`POST /orders` — пр�
     `Numeric(12,2)`, максимум `9999999999.99`. Проба, которая делает
     `UPDATE products SET price = price + 1` на цене `99999999.99`, падает
     не на блокировке, а на `NumericValueOutOfRange` (ровно это случилось в
-    `_orders_prepare_probe.py`); для проверки блокировки берите `price - 1`.
+    первой версии пробы заказа, удалена); для проверки блокировки берите
+    `price - 1`.
     А `MAX_ORDER_TOTAL` в сервисе (`9999999999.99`) — это защита от того,
     что сумма корзины не влезет в `orders.total` при создании заказа.
 22. **FastAPI: «тело необязательно, но только пустое»** — это
@@ -1131,3 +1173,13 @@ Checkout начат частично: **часть 1** (`POST /orders` — пр�
     телом запрос без тела даст 422 ещё до обработчика. Проверено в
     `POST /orders`: без тела → 409 (обработчик дошёл), `{}` → 409,
     `{"user_id": 1}` → 422.
+23. **Классификация SQL в пробах — регистронезависимо.** SQLAlchemy
+    рендерит имена таблиц в нижнем регистре (`INSERT INTO orders ...`),
+    поэтому `statement.startswith("INSERT INTO ORDERS")` молча ничего не
+    находит, и проверка «есть INSERT orders» падает, хотя запрос в БД был.
+    Ровно это случилось в `_orders_create_probe.py`: используйте
+    `upper.startswith(...)` / `"FROM USERS" in upper`.
+24. **Проба должна переживать изменение кода следующими шагами.** Проверки
+    «в файле нет слова X» ломаются, когда X появляется в докстринге про
+    будущий шаг. Сравнивайте исполняемый код (`code_only()` без
+    комментариев и `"""…"""`), а не сырой текст.

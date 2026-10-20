@@ -1,4 +1,4 @@
-# Схемы заказа (M5, шаг 1: POST /orders — только проверки, без записей).
+# Схемы заказа (M5, шаг 2: POST /orders создаёт заказ).
 #
 # Вход заказа ПУСТОЙ по смыслу: клиент не присылает ни владельца, ни сумму,
 # ни позиции. Владелец берётся из проверенного токена, позиции — из корзины
@@ -9,18 +9,24 @@
 #     _test_hook, items, ...) отклоняется 422. Это главная защита контракта:
 #     клиент не может ни подставить чужого владельца, ни назвать свою цену.
 #
-#   * OrderPreviewRead — ответ ПРЕДПРОСМОТРА: позиции, которые пойдут в
-#     заказ, и сумма по текущим ценам БД. Заказ на этом шаге ещё НЕ
-#     создаётся (записи появятся на следующем шаге), поэтому и имя
-#     "preview", а не "order": ответ не обещает, что заказ существует.
+#   * OrderRead — ответ на СОЗДАННЫЙ заказ: id, status, total, created_at и
+#     позиции. Позиция — это снимок: `price_at_purchase` (цена ОДНОЙ пары на
+#     момент покупки) и `quantity`. subtotal считается из этих двух величин.
 #
-# Деньги — Decimal и уходят в JSON строкой ("33950.00"), как во всём проекте.
+# Названия товара в позиции заказа НЕТ намеренно: в схеме M1 у order_items
+# нет колонки name, история хранит только ссылку на размер
+# (product_size_id), количество и цену. Если когда-нибудь понадобится имя в
+# истории (например, товар переименовали), это будет отдельная миграция:
+# добавить снимок name в order_items. Добавлять сюда «текущее» name из
+# каталога было бы обманом: это не часть истории заказа.
+#
+# Деньги — Decimal и уходят в JSON строкой ("21970.00", "7990.00"), как во
+# всём проекте: float для денег не используется.
 
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict
-
-from app.schemas.cart import CartItemRead
 
 
 class OrderCreate(BaseModel):
@@ -35,19 +41,45 @@ class OrderCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class OrderPreviewRead(BaseModel):
-    """Предпросмотр заказа: позиции и итог, посчитанные по данным БД.
+class OrderItemRead(BaseModel):
+    """Позиция СОЗДАННОГО заказа (снимок, а не вид на текущий каталог).
 
-    `total` — сумма `quantity * price` по ТЕКУЩИМ ценам каталога, Decimal.
-    Она не сохраняется в этом шаге: `orders.total` появится, когда появятся
-    записи. И это не «обещание цены»: пока заказ не создан, цена может
-    измениться — снимок фиксируется только при создании заказа
-    (`order_items.price_at_purchase`).
+    `price_at_purchase` — цена, которая записана в `order_items` в момент
+    оформления. Она не меняется, даже если товар подорожает или подешевеет.
+    `subtotal = price_at_purchase * quantity` — считает сервер.
+
+    `product_size_id` остаётся ссылкой на строку размеров: по ней при
+    необходимости можно найти товар, но цена из каталога к истории уже
+    отношения не имеет.
     """
 
     model_config = ConfigDict(
         json_encoders={Decimal: lambda value: format(value, "f")},
     )
 
-    items: list[CartItemRead]
+    product_size_id: int
+    quantity: int
+    price_at_purchase: Decimal
+    subtotal: Decimal
+
+
+class OrderRead(BaseModel):
+    """Созданный заказ: шапка и позиции-снимки.
+
+    `total` — снимок суммы на момент оформления (`orders.total`), а не
+    пересчёт по текущим ценам: пересчёт дал бы другую цифру после изменения
+    каталога, и история стала бы недостоверной.
+
+    `created_at` заполняет сервер БД (`func.now()`), поэтому в ответе время
+    создания, а не время клиента.
+    """
+
+    model_config = ConfigDict(
+        json_encoders={Decimal: lambda value: format(value, "f")},
+    )
+
+    id: int
+    status: str
     total: Decimal
+    created_at: datetime
+    items: list[OrderItemRead]
