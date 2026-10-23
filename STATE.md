@@ -5,13 +5,15 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M5, часть 3
-— checkout ЗАВЕРШЁН: после `Order`+`OrderItem` уменьшается остаток каждого
-размера (`stock = stock - qty` при `stock >= qty`), удаляются строки корзины
-ТОЛЬКО текущего пользователя, и всё это одним `commit` в менеджере
-транзакции. Любое исключение откатывает заказ, позиции, остатки и очистку
-(проверено внедрением ошибок на трёх стадиях). Матрица для `21970.00`:
-stock 101 3→1, stock 201 5→4, корзина 2→0, orders 0→1, order_items 0→2.
+Обновляется после каждого значимого шага. Последнее обновление: M5, часть 4
+— транзакционный слой M4–M5 переработан: сервис НЕ делает `begin()` в
+auth-сессии (там autobegin уже открыл транзакцию), а открывает свою
+`SessionLocal.begin()` через `shop.transaction()`: READ COMMITTED задаётся до
+чтений, локальные `lock_timeout=3s`/`statement_timeout=5s`, один commit на
+выходе, rollback при любом исключении, а SQLSTATE 40P01/40001/55P03/57014
+превращаются в 409 `concurrent_change_retry` (прочие ошибки не маскируются).
+HTTP-контракт не изменился (версия API `0.11.0`), изменились сигнатуры
+сервиса: теперь функции принимают только `user_id`.
 
 Инфраструктура: Docker Desktop должен быть запущен — без него PostgreSQL на
 `127.0.0.1:55433` недоступен, и проверить ничего нельзя (в части 2 так и
@@ -117,22 +119,30 @@ app/schemas/auth.py     UserRegister/UserLogin (email+password, extra=forbid), U
 app/services/catalog.py чтение и запись: ProductFilters, list_brands, list_products, get_product,
                         create_product, update_product, delete_product
                         (+ ошибки BrandNotFound/ProductNotFound/CatalogConflict/ProductDeletedConflict)
-app/services/shop.py    корзина (M4): new_session() — СВЕЖАЯ сессия на операцию, add_cart_item
-                        (замок владельца -> замок размера -> поиск пары -> проверка int4 и stock -> commit),
+app/services/shop.py    корзина (M4) и checkout (M5) на одном транзакционном слое:
+                        transaction() — НОВАЯ SessionLocal().begin() на операцию:
+                          SET TRANSACTION ISOLATION LEVEL READ COMMITTED (до чтений),
+                          SET LOCAL lock_timeout='3000ms', statement_timeout='5000ms',
+                          commit на выходе, rollback при любом исключении, close() в finally;
+                          SQLSTATE 40P01/40001/55P03/57014 -> ConcurrentChangeConflict
+                          (409 "concurrent_change_retry"), прочие ошибки не маскируются;
+                        публичные add_cart_item/get_cart/update_cart_item/delete_cart_item/
+                        create_order принимают только user_id и сами открывают транзакцию;
+                        приватные _add_cart_item/_get_cart/_update_cart_item/_delete_cart_item/
+                        _create_order работают в переданной сессии и НЕ коммитят (только flush);
+                        _sqlstate() читает код из sqlstate/diag/pgcode; _rollback_quietly();
+                        _lock_user (users FOR UPDATE) — проверка владельца в новой транзакции;
                         _load_cart_item с selectinload(CartItem.product_size -> ProductSize.product),
-                        to_read / _item_read, get_cart + _cart_rows (один SELECT с JOIN sizes и products,
+                        to_read / _item_read, _cart_rows (один SELECT с JOIN sizes и products,
                         ORDER BY cart_items.id, estimated_total по текущим ценам),
                         _get_owned_item (ОДИН SELECT: cart_items.id AND cart_items.user_id),
-                        update_cart_item (абсолютное quantity, проверка stock), delete_cart_item;
-                        checkout (M5): create_order — менеджер транзакции _transaction
-                        (один commit на выходе, rollback при любом исключении) вокруг
-                        _perform_checkout: users FOR UPDATE -> состав корзины ->
+                        _create_order: users FOR UPDATE -> состав корзины ->
                         product_sizes FOR UPDATE (ORDER BY id) -> products FOR SHARE (ORDER BY id) ->
                         ВСЕ проверки stock -> сумма Decimal и предел MAX_ORDER_TOTAL=9999999999.99 ->
                         Order(status='created', total) + flush -> OrderItem(price_at_purchase-снимок)
                         + flush -> UPDATE product_sizes SET stock = stock - qty
                         (WHERE id = :id AND stock >= :qty, ORDER BY id, rowcount=0 -> 409) ->
-                        DELETE FROM cart_items WHERE user_id = :uid -> один commit;
+                        DELETE FROM cart_items WHERE user_id = :uid; DTO после commit;
                         _fault(stage) — тестовая точка инъекции (after_order /
                         after_first_stock / after_clear_cart), НЕ HTTP-параметр;
                         ошибки CartItemNotFound/ProductSizeNotFound/CartStockConflict/CartConflict,
@@ -151,6 +161,7 @@ app/routers/order.py    POST /orders — СОЗДАЁТ заказ (201 + OrderR
                         снимок цен, списание остатка, очистка своей корзины; маршрут САМОГО
                         пользователя (без require_admin), тело необязательно (OrderCreate | None),
                         409: Cart is empty / Not enough stock / Order total exceeds maximum
+                        / concurrent_change_retry
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
                         HTTPBearer + get_current_user/CurrentUser, get_current_user_id и require_admin/AdminUser
@@ -175,7 +186,7 @@ prompts/                тексты заданий модулей + этот ф
 `_cart_items_acceptance.ps1`, `_cart_get_service_probe.py`,
 `_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_cart_isolation_probe.py`,
 `_cart_patch_delete_probe.py`, `_cart_duplicate_probe.py`, `_m4_review_probe.py`,
-`_orders_checkout_probe.py`,
+`_orders_checkout_probe.py`, `_transaction_probe.py`,
 `_pg_admin.py`,
 `check_env.py`, `sql/`.
 
@@ -355,10 +366,59 @@ M4. Проверяется только `quantity <= stock`; списание �
 :qty`).
 
 **DTO собирается до закрытия сессии.** `get_cart`/`add_cart_item` возвращают
-Pydantic-модели (Decimal/int/str), а не ORM-объекты: роутер закрывает сессию
-сразу после возврата сервиса, и обращение к отсоединённому ORM-объекту дало
-бы `DetachedInstanceError`. Проверено и это: в элементах `CartRead` нет
+Pydantic-модели (Decimal/int/str), а не ORM-объекты: `transaction()` закрывает
+сессию сразу после возврата сервиса, и обращение к отсоединённому ORM-объекту
+дало бы `DetachedInstanceError`. Проверено и это: в элементах `CartRead` нет
 `_sa_instance_state`.
+
+## Транзакционный слой M4–M5 (`shop.transaction()`)
+
+```
+HTTP-запрос
+  Depends(get_current_user)  -> сессия auth из Depends(get_session):
+                                 чтение User открыло транзакцию (autobegin)
+                                 -> begin() в ней ЗАПРЕЩЁН (InvalidRequestError)
+  роутер -> shop.add_cart_item(user_id, data)   (только проверенный user.id)
+    transaction():
+      session = SessionLocal()          # НОВАЯ сессия, не auth
+      session.begin()                   # явный begin на пустой сессии
+      SET TRANSACTION ISOLATION LEVEL READ COMMITTED   # до любых чтений
+      SET LOCAL lock_timeout   = '3000ms'
+      SET LOCAL statement_timeout = '5000ms'
+      yield session                     # внутри: _lock_user (users FOR UPDATE), работа
+      commit  (нормальный выход) | rollback (любое исключение)
+      finally: session.close()          # соединение возвращается в пул
+```
+
+**Autobegin и почему нельзя `begin()` в auth-сессии.** SQLAlchemy 2.0
+начинает транзакцию неявно при первом обращении к БД. Зависимость
+аутентификации уже прочитала `User`, поэтому в её сессии транзакция активна;
+`session.begin()` там даёт `InvalidRequestError: A transaction is already
+begun on this Session`. Поэтому сервис создаёт **свою** сессию и начинает
+транзакцию только в ней, а из auth-слоя забирает только `user.id`. Auth-сессию
+сервис не коммитит и не использует как «обход»: в роутерах нет
+`session.commit()`/`session.rollback()` (проверено по исходникам).
+
+**Почему `SET LOCAL`.** `SET TRANSACTION` действует на текущую транзакцию,
+`SET LOCAL` — тоже, но не протекает в другие запросы, взявшие то же соединение
+из пула. Глобальный `statement_timeout=3000` из `create_engine(options)` внутри
+транзакции переопределяется на 5000 мс, а `lock_timeout=3000` включает
+ожидание замка не дольше 3 с.
+
+**Классификация ошибок.**
+
+| SQLSTATE | Что это | Ответ |
+|---|---|---|
+| `40P01` | deadlock_detected | 409 `concurrent_change_retry` |
+| `40001` | serialization_failure | 409 `concurrent_change_retry` |
+| `55P03` | lock_not_available (наш `lock_timeout`) | 409 `concurrent_change_retry` |
+| `57014` | query_canceled (наш `statement_timeout`) | 409 `concurrent_change_retry` |
+| прочее (23505, 22012, ошибки кода) | — | пробрасывается как есть |
+
+Перед переводом в 409 транзакция **откатывается** (данные не изменены), и
+повтор возможен только со стороны клиента: сервер не повторяет checkout
+скрыто, иначе при обрыве соединения мог бы создать второй заказ.
+
 
 ## БД: устройство и правила
 
@@ -511,6 +571,16 @@ powershell -NoProfile -File _cart_get_acceptance.ps1
 #     откат заказа, позиций, остатков и очистки (hook — внутренний, не HTTP);
 #     нехватка остатка -> 409 и ничего не меняется.
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _orders_checkout_probe.py
+
+# 25) ТРАНЗАКЦИОННЫЙ СЛОЙ (M5, часть 4): своя временная БД + сервер 8001.
+#     autobegin: в auth-сессии begin() падает; сервис открывает свою сессию;
+#     первые SQL — SET TRANSACTION READ COMMITTED, SET LOCAL lock_timeout 3s,
+#     SET LOCAL statement_timeout 5s; commit на выходе, rollback при исключении;
+#     55P03 (lock_timeout) и 57014 (statement_timeout) -> 409
+#     concurrent_change_retry (и по HTTP тоже), после снятия блокировки повтор 200;
+#     деление на ноль и IntegrityError НЕ маскируются; пул после операций пуст;
+#     в роутерах нет session.commit()/rollback().
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _transaction_probe.py
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -920,11 +990,30 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   ничего не изменилось. Схема не менялась: 8 таблиц, 4 UNIQUE, ревизия
   `201c8afcccba`. Все наборы M4 перезапущены — зелёные; рабочая БД не
   менялась.
+* M5 (часть 4, транзакционный слой): `_transaction_probe.py` → `ALL
+  TRANSACTION CHECKS PASSED` (своя временная БД, сервер 8001). Фактически:
+  в auth-сессии после чтения `User` `in_transaction()==True`, а
+  `session.begin()` падает с `InvalidRequestError: A transaction is already
+  begun on this Session` — поэтому сервис берёт СВОЮ `SessionLocal()`;
+  первые операторы транзакции — `SET TRANSACTION ISOLATION LEVEL READ
+  COMMITTED`, `SET LOCAL lock_timeout = '3000ms'`, `SET LOCAL
+  statement_timeout = '5000ms'`, и только потом `SELECT users … FOR
+  UPDATE`; `SHOW` внутри транзакции даёт `read committed` / `3s` / `5s`.
+  Успешная операция — ровно один `after_commit`, данные видны; исключение
+  внутри `transaction()` — `after_rollback`, данных нет, в пуле 0 занятых.
+  Удержание `users FOR UPDATE` 4.5 с → сервис ждёт ~3.0 с и получает
+  `ConcurrentChangeConflict` с detail `concurrent_change_retry` (и по HTTP
+  `409 {"detail":"concurrent_change_retry"}`), после снятия блокировки
+  повтор → 200. `SELECT pg_sleep(6)` → 57014 → тот же 409. Деление на ноль
+  (`22012`) остаётся `DataError`, дубль пары (`23505`) остаётся
+  `IntegrityError` — НЕ 409. В роутерах нет `session.commit()`/
+  `session.rollback()`. Схема: 8 таблиц, ревизия `201c8afcccba`.
 
 ## Чего ещё нет
 
 * Checkout завершён: заказ, позиции-снимки, списание остатка и очистка
-  своей корзины — одна транзакция (части 2 и 3).
+  своей корзины — одна транзакция (части 2 и 3), транзакционный слой общий
+  для корзины и checkout (часть 4).
 * Не сделана только **смена статуса** заказа: `PATCH /orders/{id}/status`
   под `require_admin` (`403` неадминистратору, `404` чужой/несуществующий,
   `422` недопустимый статус). Это следующий шаг.
@@ -1205,3 +1294,18 @@ query-параметром: иначе клиент сможет ломать ch
     «в файле нет слова X» ломаются, когда X появляется в докстринге про
     будущий шаг. Сравнивайте исполняемый код (`code_only()` без
     комментариев и `"""…"""`), а не сырой текст.
+25. **Не вызывать `begin()` в сессии, которую уже использовали для чтения.**
+    SQLAlchemy 2.0 начинает транзакцию неявно (autobegin), поэтому
+    `get_current_user` оставляет auth-сессию в активной транзакции, и
+    `session.begin()` даёт `InvalidRequestError`. Бизнес-операции открывают
+    СВОЮ `SessionLocal()` (`shop.transaction()`), а не переиспользуют
+    auth-сессию и не коммитят её. Проверено в `_transaction_probe.py`.
+26. **Проверки по исходникам — только по коду, не по тексту.** После
+    появления докстринга про `UPDATE product_sizes` наивная проверка
+    «в сервисе нет UPDATE stock» упала; теперь `code_only()` в
+    `_m4_review_probe.py` вырезает и `#`-строки, и `"""…"""`-блоки.
+27. **Пробу, которая проверяет транзакции, не держать дольше таймаутов.**
+    Сервис ставит локальные `lock_timeout=3s`/`statement_timeout=5s`:
+    тест, удерживающий блокировку 4–5 с, получит 409 `concurrent_change_retry`
+    (это и проверяется), а тест, которому нужно «просто подождать», должен
+    укладываться в 3 с или использовать своё соединение без этих настроек.

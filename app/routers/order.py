@@ -91,5 +91,4 @@ def create_order(
     """
     # Тело намеренно не используется: контракт — «ничего не прислать».
     _ = payload
-    with shop_service.new_session() as session:
-        return shop_service.create_order(session, user_id)
+    return shop_service.create_order(user_id)

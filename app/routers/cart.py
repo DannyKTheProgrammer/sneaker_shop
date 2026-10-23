@@ -69,11 +69,10 @@ def read_cart(user_id: CurrentUserId) -> CartRead:
     (ORDER BY cart_items.id), поэтому клиент может опираться на него при
     отрисовке списка.
 
-    Сессия открывается заново внутри сервиса и закрывается сразу после
-    возврата: DTO уже собран, ORM-объекты снаружи не живут.
+    Сессия открывается внутри сервиса (`transaction()`) и закрывается сразу
+    после возврата: DTO уже собран, ORM-объекты снаружи не живут.
     """
-    with shop_service.new_session() as session:
-        return shop_service.get_cart(session, user_id)
+    return shop_service.get_cart(user_id)
 
 
 @router.post(
@@ -101,18 +100,17 @@ def add_cart_item(payload: CartItemAdd, user_id: CurrentUserId) -> CartItemRead:
     то, что итоговое количество не превышает остаток (иначе 409) — за
     вычетом остатка придёт очередь checkout.
 
-    Сессия открывается заново внутри сервиса: зависимость аутентификации
-    уже прочитала users и открыла транзакцию в своей сессии, а бизнес-
-    операции нужен свежий снимок данных и свои блокировки (подробно —
-    в app/services/shop.py).
+    Сессия открывается заново внутри сервиса (`shop_service.transaction()`):
+    зависимость аутентификации уже прочитала users и открыла транзакцию в
+    своей сессии, а бизнес-операции нужны своя транзакция, READ COMMITTED,
+    локальные таймауты и свои блокировки (подробно — в app/services/shop.py).
 
     Ответ 200 (а не 201) в обоих случаях — и при вставке, и при увеличении:
     клиенту важно состояние позиции, а не то, была ли она создана; при этом
     идемпотентность не заявляется, потому что повторный вызов МЕНЯЕТ
     количество.
     """
-    with shop_service.new_session() as session:
-        return shop_service.add_cart_item(session, user_id, payload)
+    return shop_service.add_cart_item(user_id, payload)
 
 
 @router.patch(
@@ -153,8 +151,7 @@ def update_cart_item(
     отрицательные отклоняет схема (422): чтобы убрать позицию, её удаляют.
     Количество больше остатка — 409, и данные при этом не меняются.
     """
-    with shop_service.new_session() as session:
-        return shop_service.update_cart_item(session, user_id, item_id, payload)
+    return shop_service.update_cart_item(user_id, item_id, payload)
 
 
 @router.delete(
@@ -179,6 +176,5 @@ def delete_cart_item(item_id: ItemId, user_id: CurrentUserId) -> Response:
     Остаток не трогаем: корзина не резервирует товар, поэтому удаление
     позиции не возвращает и не списывает ни одной пары.
     """
-    with shop_service.new_session() as session:
-        shop_service.delete_cart_item(session, user_id, item_id)
+    shop_service.delete_cart_item(user_id, item_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

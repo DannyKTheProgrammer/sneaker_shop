@@ -35,11 +35,12 @@
 # Замки живут до COMMIT или ROLLBACK — то есть ровно одну бизнес-операцию.
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import delete, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import delete, select, text, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import ShopConflict, ShopError, ShopNotFound
@@ -64,6 +65,25 @@ MAX_ORDER_TOTAL = Decimal("9999999999.99")
 # Начальный статус заказа. Значение обязано попадать в CHECK
 # status IN ('created', 'processing', 'completed') из миграции M1.
 ORDER_STATUS_CREATED = "created"
+
+# SQLSTATE, означающие «транзакцию прервали, работу можно безопасно повторить»:
+#   40P01 deadlock_detected        — PostgreSQL выбрал нас жертвой циклa;
+#   40001 serialization_failure    — конфликт сериализации (на READ COMMITTED
+#                                    редок, но бывает при SSI/повторах);
+#   55P03 lock_not_available       — сработал наш собственный lock_timeout;
+#   57014 query_canceled           — сработал statement_timeout.
+RETRYABLE_SQLSTATES = frozenset({"40P01", "40001", "55P03", "57014"})
+
+# Текст ответа для 409, когда транзакцию прервали. Именно эта строка уходит
+# клиенту: он может повторить запрос сам (но сервер НЕ повторяет его скрыто).
+CONCURRENT_RETRY_DETAIL = "concurrent_change_retry"
+
+# Локальные (SET LOCAL) таймауты транзакции сервиса. Они действуют только до
+# конца транзакции и не протекают в соседние запросы, взявшие то же соединение
+# из пула. Значения выбраны так: lock_timeout (3 c) — ожидание замка владельца
+# или строки размера; statement_timeout (5 c) — общий предел одного оператора.
+OWNER_LOCK_TIMEOUT_MS = 3000
+STATEMENT_TIMEOUT_MS = 5000
 
 # Ноль в денежном масштабе: numeric(10,2) хранит два знака после точки, и
 # пустая корзина должна отдавать "0.00", а не "0" (Decimal("0") ушёл бы в
@@ -130,15 +150,115 @@ class OrderTotalConflict(ShopConflict):
     detail = "Order total exceeds the allowed maximum"
 
 
-def new_session() -> Session:
-    """Свежая сессия под одну бизнес-операцию.
+class ConcurrentChangeConflict(ShopConflict):
+    """Транзакцию прервала конкуренция: deadlock, конфликт, таймаут (409).
 
-    Возвращаем именно Session, а не контекстный менеджер: вызывающий код
-    (сервисная функция) сам решает, когда коммитить и когда откатывать, и
-    закрывает сессию в finally. Так владелец транзакции остаётся один —
-    эта функция, а не FastAPI-зависимость.
+    Отдаёт `{"detail": "concurrent_change_retry"}` и означает: ничего не
+    зафиксировано, клиент может повторить операцию сам. Сервер НЕ повторяет
+    её автоматически: при обрыве соединения исход неизвестен, и повтор мог бы
+    создать второй заказ.
+    """
+
+    detail = CONCURRENT_RETRY_DETAIL
+
+
+def new_session() -> Session:
+    """Сессия «как есть»: для тестов и для инструментов, не для сервиса.
+
+    Бизнес-операции M4–M5 сессию сами не создают через эту функцию — они
+    входят в `transaction()`, который задаёт изоляцию, таймауты и владеет
+    commit/rollback. Здесь `SessionLocal()` оставлен для проб (нужен Engine,
+    внутрь которого они вставляют listener) и для ручных экспериментов.
     """
     return SessionLocal()
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    """SQLSTATE из исключения драйвера (psycopg кладёт его в разные места).
+
+    Приоритет: `orig.sqlstate`, затем `orig.diag.sqlstate`, затем
+    `orig.pgcode`/`__cause__.sqlstate`. Возвращает None, если код не найден —
+    тогда ошибка не будет замаскирована под «повторите».
+    """
+    orig = getattr(exc, "orig", None)
+    candidates = (orig, getattr(orig, "diag", None), getattr(orig, "__cause__", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for attribute in ("sqlstate", "pgcode"):
+            value = getattr(candidate, attribute, None)
+            if isinstance(value, str) and len(value) == 5:
+                return value
+    return None
+
+
+def _rollback_quietly(session: Session) -> None:
+    """Откатить, не скрывая исходную ошибку.
+
+    rollback сам может упасть (например, соединение уже разорвано), но это
+    не повод потерять настоящее исключение: его пробросит вызывающий код.
+    """
+    with suppress(Exception):
+        session.rollback()
+
+
+@contextmanager
+def transaction() -> Iterator[Session]:
+    """Новая SessionLocal().begin() на одну бизнес-операцию корзины или checkout.
+
+    Зачем нужен отдельный менеджер, а не `with session.begin()` в роутере:
+
+    1. **Autobegin конфликт.** Зависимость аутентификации `get_current_user`
+       читает `User` в сессии из `Depends(get_session)`, и это уже открытая
+       транзакция (SQLAlchemy 2.0 начинает её неявно — autobegin). Вызвать в
+       той же сессии `session.begin()` нельзя: будет `InvalidRequestError`.
+       Поэтому сервис открывает СВОЮ сессию (`SessionLocal()`) и работает в
+       ней; из auth-слоя приходит только проверенный `user.id`.
+    2. **Изоляция задаётся ДО чтений.** `SET TRANSACTION ISOLATION LEVEL
+       READ COMMITTED` — первый оператор после явного `begin()` (begin() не
+       отправляет SQL), поэтому ни одно чтение не успевает пройти раньше.
+    3. **Локальные таймауты.** `SET LOCAL lock_timeout`/`statement_timeout`
+       действуют до конца транзакции и не остаются на соединении в пуле.
+    4. **Один владелец commit/rollback.** Commit — на нормальном выходе,
+       rollback — при любом исключении; `close()` — всегда, в finally. Auth
+       сессия при этом не коммитится и не «спасает» операцию.
+    5. **Повторяемые ошибки — отдельный 409.** SQLSTATE 40P01/40001/55P03/57014
+       (deadlock, serialization, сработавший lock_timeout, statement_timeout)
+       сначала откатываются, затем превращаются в `ConcurrentChangeConflict`
+       (409 `concurrent_change_retry`). Все прочие ошибки (включая
+       `IntegrityError` и ошибки в коде) пробрасываются как есть и не
+       маскируются под «повторите».
+    """
+    session = SessionLocal()
+    try:
+        session.begin()  # явный begin, транзакция ещё не начата (сессия новая)
+        session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+        session.execute(text(f"SET LOCAL lock_timeout = '{OWNER_LOCK_TIMEOUT_MS}ms'"))
+        session.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'"))
+        yield session
+    except DBAPIError as exc:
+        # Сюда попадают и ошибки от flush (например, UNIQUE): откатываем, но
+        # маскируем только те, что в RETRYABLE_SQLSTATES.
+        _rollback_quietly(session)
+        if _sqlstate(exc) in RETRYABLE_SQLSTATES:
+            raise ConcurrentChangeConflict() from exc
+        raise
+    except BaseException:
+        # ShopError и любые программные ошибки: откат и проброс без маскировки.
+        _rollback_quietly(session)
+        raise
+    else:
+        try:
+            session.commit()
+        except DBAPIError as exc:
+            _rollback_quietly(session)
+            if _sqlstate(exc) in RETRYABLE_SQLSTATES:
+                raise ConcurrentChangeConflict() from exc
+            raise
+    finally:
+        # Сессия закрывается всегда: соединение возвращается в пул, а если
+        # транзакция осталась открытой (например, после ошибки) — откатывается.
+        session.close()
 
 
 def _lock_user(session: Session, user_id: int) -> None:
@@ -230,8 +350,18 @@ def _integrity_error_kind(exc: IntegrityError) -> str | None:
     return getattr(diag, "constraint_name", None)
 
 
-def add_cart_item(session: Session, user_id: int, data: CartItemAdd) -> CartItemRead:
-    """Добавить размер в корзину пользователя на delta единиц.
+def add_cart_item(user_id: int, data: CartItemAdd) -> CartItemRead:
+    """Добавить размер в корзину (POST /cart/items), своя транзакция.
+
+    Принимает только проверенный `user.id` и данные запроса: сессию, изоляцию
+    и commit/rollback даёт `transaction()`.
+    """
+    with transaction() as session:
+        return _add_cart_item(session, user_id, data)
+
+
+def _add_cart_item(session: Session, user_id: int, data: CartItemAdd) -> CartItemRead:
+    """Тело добавления: блокировки, проверки, запись. Commit — вне функции.
 
     Порядок шагов (он же протокол блокировок):
 
@@ -242,12 +372,11 @@ def add_cart_item(session: Session, user_id: int, data: CartItemAdd) -> CartItem
        если есть — прибавить delta к текущему количеству;
     4. проверить ИТОГОВОЕ количество: оно должно помещаться в int4 и не
        превышать остаток размера. Иначе CartStockConflict (409);
-    5. зафиксировать транзакцию (commit) и вернуть позицию с товаром.
+    5. `flush` — отправить INSERT/UPDATE в текущую транзакцию и получить id;
+       фиксацию сделает `transaction()` на выходе (ровно один commit).
 
     Остаток склада НЕ уменьшается: корзина ничего не резервирует. Списание
-    остатка — задача оформления заказа (checkout), где остаток проверяется
-    повторно под блокировкой. Поэтому «двое положили в корзину последнюю
-    пару» — норма, а «двое её купили» — нет.
+    остатка — задача checkout, где остаток проверяется повторно под блокировкой.
 
     Проверка переполнения нужна отдельно от проверки остатка: quantity —
     это Integer (int4), и если бы мы позволили сумме выйти за 2147483647,
@@ -280,24 +409,20 @@ def add_cart_item(session: Session, user_id: int, data: CartItemAdd) -> CartItem
         )
 
     try:
-        session.commit()
+        # flush, а не commit: фиксация — в transaction(). Здесь же ловится
+        # UNIQUE(user_id, product_size_id) — гонка двух вставок одной пары.
+        session.flush()
     except IntegrityError as exc:
-        # Единственный ожидаемый случай — UNIQUE(user_id, product_size_id):
-        # параллельная вставка той же пары. Остальные нарушения целостности
-        # не маскируем — пусть всплывают как 500, это ошибка в коде.
-        #
-        # Имя ограничения читаем ДО rollback: после отката объект исключения
-        # остаётся, но зависеть от этого не стоит.
-        constraint = _integrity_error_kind(exc)
-        session.rollback()
-        if constraint == CART_SIZE_UNIQUE or _is_unique_violation(exc):
+        # Остальные нарушения целостности не маскируем: пусть всплывают,
+        # это ошибка в коде или схеме, а не «конфликт корзины».
+        if _integrity_error_kind(exc) == CART_SIZE_UNIQUE or _is_unique_violation(exc):
             raise CartConflict() from exc
         raise
 
-    # Строка уже в БД; читаем её вместе с размером и товаром ОДНИМ запросом
-    # на связь (selectinload), чтобы ответ не сделал ленивых запросов.
+    # Строка уже в БД (в этой транзакции); читаем её с размером и товаром
+    # ОДНИМ запросом на связь (selectinload), чтобы ответ без ленивых запросов.
     saved = _load_cart_item(session, item.id)
-    if saved is None:  # pragma: no cover - сразу после commit строки быть не может
+    if saved is None:  # pragma: no cover - сразу после flush строки быть не может
         raise CartItemNotFound()
     return to_read(saved)
 
@@ -346,10 +471,16 @@ def _get_owned_item(session: Session, user_id: int, item_id: int) -> CartItem | 
     ).scalar_one_or_none()
 
 
-def update_cart_item(
+def update_cart_item(user_id: int, item_id: int, data: CartItemUpdate) -> CartItemRead:
+    """Установить АБСОЛЮТНОЕ количество позиции (PATCH), своя транзакция."""
+    with transaction() as session:
+        return _update_cart_item(session, user_id, item_id, data)
+
+
+def _update_cart_item(
     session: Session, user_id: int, item_id: int, data: CartItemUpdate
 ) -> CartItemRead:
-    """Установить АБСОЛЮТНОЕ количество позиции (PATCH).
+    """Тело PATCH: блокировки, проверка остатка, запись. Commit — вне функции.
 
     Порядок шагов (тот же протокол, что у остальных операций корзины):
 
@@ -363,7 +494,8 @@ def update_cart_item(
     4. проверить `quantity <= stock`: иначе CartStockConflict (409).
        Ноль и отрицательные сюда не доходят — их отсекает схема (422), а
        нижняя граница ещё и CHECK quantity > 0 в БД;
-    5. записать quantity = data.quantity (ЗАМЕНА, не прибавка) и commit.
+    5. записать quantity = data.quantity (ЗАМЕНА, не прибавка) и `flush`;
+       фиксацию сделает `transaction()` на выходе.
 
     Ответ 200 с той же формой, что у POST /cart/items: клиенту после
     PATCH обычно нужен пересчитанный subtotal.
@@ -388,26 +520,24 @@ def update_cart_item(
         )
 
     item.quantity = data.quantity
+    session.flush()
 
-    try:
-        session.commit()
-    except IntegrityError as exc:  # pragma: no cover - схема уже проверила диапазон
-        # Сюда можно попасть только при гонке с ограничением целостности
-        # (например, CHECK quantity > 0, если схему когда-нибудь поменяют).
-        session.rollback()
-        raise
-
-    # DTO собираем из объектов, которые уже держим: после commit с
-    # expire_on_commit=False значения не просрочены, а связи (размер и
-    # товар) прочитаны явно. Лишнего SELECT на ответ нет.
+    # DTO собираем из объектов, которые уже держим: связи (размер и товар)
+    # прочитаны явно, лишнего SELECT на ответ нет.
     return _item_read(item, product_size, product)
 
 
-def delete_cart_item(session: Session, user_id: int, item_id: int) -> None:
-    """Удалить свою позицию из корзины (DELETE → 204).
+def delete_cart_item(user_id: int, item_id: int) -> None:
+    """Удалить свою позицию из корзины (DELETE → 204), своя транзакция."""
+    with transaction() as session:
+        _delete_cart_item(session, user_id, item_id)
+
+
+def _delete_cart_item(session: Session, user_id: int, item_id: int) -> None:
+    """Тело DELETE: блокировка владельца, поиск своей строки, удаление.
 
     Шаги: заблокировать владельца → найти позицию по (id, user_id) → удалить
-    строку → commit.
+    строку и `flush`; commit сделает `transaction()`.
 
     Размер (product_sizes) здесь НЕ блокируется: остаток не меняется ни на
     единицу, а значит и защищать нечего. Это же отличие от checkout, где
@@ -425,7 +555,7 @@ def delete_cart_item(session: Session, user_id: int, item_id: int) -> None:
         raise CartItemNotFound()
 
     session.delete(item)
-    session.commit()
+    session.flush()
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:
@@ -504,8 +634,20 @@ def _cart_rows(
     return list(session.execute(stmt).all())
 
 
-def get_cart(session: Session, user_id: int) -> CartRead:
+def get_cart(user_id: int) -> CartRead:
     """Своя корзина: позиции по возрастанию id и ориентировочная сумма.
+
+    Принимает только `user.id`; сессию, изоляцию и commit/rollback даёт
+    `transaction()`. Чтение тоже идёт через менеджер: так действуют единые
+    READ COMMITTED и локальные таймауты, а `FOR UPDATE` на владельце
+    снимается ровно на COMMIT.
+    """
+    with transaction() as session:
+        return _get_cart(session, user_id)
+
+
+def _get_cart(session: Session, user_id: int) -> CartRead:
+    """Тело чтения корзины: замок владельца, один JOIN, DTO в памяти.
 
     Порядок шагов:
 
@@ -530,12 +672,8 @@ def get_cart(session: Session, user_id: int) -> CartRead:
     Цена берётся ТЕКУЩАЯ из products, а не из заказа, поэтому
     estimated_total — оценка: см. пояснение в docstring CartRead.
 
-    DTO собирается ДО выхода из сессии (роутер закрывает её сразу после
-    возврата). Это не косметика: после закрытия сессии любой ORM-объект
-    отсоединён, и обращение к его незагруженным атрибутам дало бы
-    DetachedInstanceError. CartItemRead/CartRead — обычные Pydantic-модели,
-    в них только Decimal, int и str, поэтому они живут без сессии сколько
-    угодно.
+    DTO собирается до выхода из `transaction()`: CartItemRead/CartRead —
+    обычные Pydantic-модели (Decimal, int, str), им не нужна живая сессия.
     """
     _lock_user(session, user_id)
 
@@ -663,42 +801,7 @@ def _fault(stage: str) -> None:
         hook(stage)
 
 
-@contextmanager
-def _transaction(session: Session) -> Iterator[None]:
-    """Менеджер транзакции checkout: один commit на выходе, rollback на ошибке.
-
-    Зачем отдельный менеджер, а не `session.commit()` в конце функции:
-
-    * commit ровно один и в одном месте — его нельзя случайно вызвать внутри
-      цикла по позициям и зафиксировать половину заказа;
-    * ЛЮБОЕ исключение (409 из проверки, `IntegrityError`, `RuntimeError`,
-      тестовый сбой, `KeyboardInterrupt`) проходит через `rollback`, поэтому
-      заказ, позиции, остатки и очистка корзины откатываются вместе;
-    * `with session.begin()` здесь не подходит: сессия пришла из
-      `new_session()`, но первый же SELECT открывает транзакцию (autobegin), и
-      повторный `begin()` дал бы `InvalidRequestError`.
-    """
-    try:
-        yield
-    except IntegrityError as exc:
-        session.rollback()
-        raise ShopConflict(
-            "Order could not be created because of a concurrent change"
-        ) from exc
-    except BaseException:
-        session.rollback()
-        raise
-    else:
-        try:
-            session.commit()
-        except IntegrityError as exc:  # ошибка может всплыть только на commit
-            session.rollback()
-            raise ShopConflict(
-                "Order could not be created because of a concurrent change"
-            ) from exc
-
-
-def create_order(session: Session, user_id: int) -> OrderRead:
+def create_order(user_id: int) -> OrderRead:
     """Оформить заказ: проверки и записи в ОДНОЙ транзакции, один commit.
 
     Порядок (он же протокол блокировок):
@@ -722,8 +825,9 @@ def create_order(session: Session, user_id: int) -> OrderRead:
        `UPDATE product_sizes SET stock = stock - :qty WHERE id = :id AND
        stock >= :qty` для каждого размера (по возрастанию id) →
        `DELETE FROM cart_items WHERE user_id = :uid` (только своя корзина) →
-       единственный `commit` на выходе из `_transaction`;
-    9. DTO собирается ПОСЛЕ успешного commit и до закрытия сессии.
+       единственный `commit` на выходе из `transaction()`;
+    9. DTO собирается ПОСЛЕ успешного commit и уже без сессии — из простых
+       значений (id, status, total, created_at, позиции), а не из ORM-объектов.
 
     **Почему `WHERE stock >= :qty` в UPDATE.** Проверка в шаге 6 сделана под
     блокировкой, поэтому обычно всё сходится. Условие в самом UPDATE — это
@@ -741,22 +845,37 @@ def create_order(session: Session, user_id: int) -> OrderRead:
     повторов (outcome неизвестен только при обрыве соединения, и повторять
     такой checkout автоматически нельзя).
     """
-    with _transaction(session):
-        order, prepared = _perform_checkout(session, user_id)
+    with transaction() as session:
+        order_id, status, total, created_at, items = _create_order(session, user_id)
 
-    # После commit объекты не просрочены (expire_on_commit=False).
-    if order.created_at is None:  # pragma: no cover - RETURNING заполняет сразу
-        session.refresh(order)
-    return _order_read(order, prepared)
+    # DTO собирается ПОСЛЕ успешного commit и после закрытия сессии: здесь
+    # только простые значения, ни одного ORM-объекта, поэтому ленивых
+    # запросов и DetachedInstanceError быть не может.
+    return OrderRead(
+        id=order_id,
+        status=status,
+        total=total,
+        created_at=created_at,
+        items=[
+            OrderItemRead(
+                product_size_id=product_size_id,
+                quantity=quantity,
+                price_at_purchase=price,
+                subtotal=price * quantity,
+            )
+            for product_size_id, quantity, price in items
+        ],
+    )
 
 
-def _perform_checkout(
+def _create_order(
     session: Session, user_id: int
-) -> tuple[Order, list[tuple[int, Product, int, Decimal]]]:
+) -> tuple[int, str, Decimal, datetime, list[tuple[int, int, Decimal]]]:
     """Тело checkout без менеджера транзакции: проверки, затем записи.
 
-    Возвращает созданный `Order` и `prepared` (id размера, товар, количество,
-    стоимость позиции) — из этого собирается DTO уже после commit.
+    Возвращает простые значения: id заказа, статус, сумму, created_at и
+    список (id размера, количество, снимок цены). Из них после commit
+    собирается DTO — уже без сессии.
     """
     _lock_user(session, user_id)
 
@@ -848,25 +967,14 @@ def _perform_checkout(
     session.execute(delete(CartItem).where(CartItem.user_id == user_id))
     _fault("after_clear_cart")
 
-    return order, prepared
-
-
-def _order_read(
-    order: Order, prepared: list[tuple[int, Product, int, Decimal]]
-) -> OrderRead:
-    """DTO созданного заказа из шапки и подготовленных позиций-снимков."""
-    return OrderRead(
-        id=order.id,
-        status=order.status,
-        total=order.total,
-        created_at=order.created_at,
-        items=[
-            OrderItemRead(
-                product_size_id=product_size_id,
-                quantity=quantity,
-                price_at_purchase=product.price,
-                subtotal=subtotal,
-            )
-            for product_size_id, product, quantity, subtotal in prepared
-        ],
+    if order.created_at is None:  # pragma: no cover - RETURNING заполняет сразу
+        session.refresh(order)
+    # Наружу — простые значения: DTO соберётся уже после commit и без сессии.
+    return (
+        order.id,
+        order.status,
+        order.total,
+        order.created_at,
+        [(product_size_id, quantity, product.price)
+         for product_size_id, product, quantity, _subtotal_value in prepared],
     )
