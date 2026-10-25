@@ -5,15 +5,16 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M5, часть 4
-— транзакционный слой M4–M5 переработан: сервис НЕ делает `begin()` в
-auth-сессии (там autobegin уже открыл транзакцию), а открывает свою
-`SessionLocal.begin()` через `shop.transaction()`: READ COMMITTED задаётся до
-чтений, локальные `lock_timeout=3s`/`statement_timeout=5s`, один commit на
-выходе, rollback при любом исключении, а SQLSTATE 40P01/40001/55P03/57014
-превращаются в 409 `concurrent_change_retry` (прочие ошибки не маскируются).
-HTTP-контракт не изменился (версия API `0.11.0`), изменились сигнатуры
-сервиса: теперь функции принимают только `user_id`.
+Обновляется после каждого значимого шага. Последнее обновление: M5, часть 5
+— гонка двух покупателей за последнюю пару проверена наблюдаемым тестом
+блокировок (`_checkout_race_probe.py`); код приложения не менялся (версия
+API остаётся `0.11.0`). Предыдущий шаг (часть 4): транзакционный слой —
+сервис НЕ делает `begin()` в auth-сессии (там autobegin уже открыл
+транзакцию), а открывает свою `SessionLocal.begin()` через
+`shop.transaction()`: READ COMMITTED задаётся до чтений, локальные
+`lock_timeout=3s`/`statement_timeout=5s`, один commit на выходе, rollback при
+любом исключении, а SQLSTATE 40P01/40001/55P03/57014 превращаются в 409
+`concurrent_change_retry` (прочие ошибки не маскируются).
 
 Инфраструктура: Docker Desktop должен быть запущен — без него PostgreSQL на
 `127.0.0.1:55433` недоступен, и проверить ничего нельзя (в части 2 так и
@@ -187,7 +188,7 @@ prompts/                тексты заданий модулей + этот ф
 `_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_cart_isolation_probe.py`,
 `_cart_patch_delete_probe.py`, `_cart_duplicate_probe.py`, `_m4_review_probe.py`,
 `_orders_checkout_probe.py`, `_transaction_probe.py`,
-`_pg_admin.py`,
+`_checkout_race_probe.py`, `_pg_admin.py`,
 `check_env.py`, `sql/`.
 
 ## Путь запроса (архитектура M2)
@@ -581,6 +582,16 @@ powershell -NoProfile -File _cart_get_acceptance.ps1
 #     деление на ноль и IntegrityError НЕ маскируются; пул после операций пуст;
 #     в роутерах нет session.commit()/rollback().
 .\sneaker_shop_.venv\Scripts\python.exe -X utf8 _transaction_probe.py
+
+# 26) ГОНКА ЗА ПОСЛЕДНЮЮ ПАРУ (M5, часть 5): своя БД sneaker_race_<random>,
+#     uvicorn в потоке САМОЙ пробы (порт 8001), т.к. shop._FAULT_HOOK —
+#     Python-атрибут. stock 101 = 1, Аня и Борис кладут 101 x1; checkout Ани
+#     "паркуется" hook-ом after_clear_cart до commit; Борис ждёт: pg_blocking_pids
+#     = [Аня], wait_event_type=Lock, ShareLock на transactionid; после commit Ани
+#     Борис получает 409 Not enough stock (stock 0, не -1); deadlock с "чужим"
+#     соединением -> 40P01 -> 409 concurrent_change_retry. Ожидаемо: ALL
+#     CHECKOUT RACE CHECKS PASSED (3 прогона подряд стабильно).
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _checkout_race_probe.py
 ```
 
 Ключ подписи: `python setup_jwt.py` (создаёт `JWT_SECRET` в `.env`, повторно
@@ -1008,6 +1019,45 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   (`22012`) остаётся `DataError`, дубль пары (`23505`) остаётся
   `IntegrityError` — НЕ 409. В роутерах нет `session.commit()`/
   `session.rollback()`. Схема: 8 таблиц, ревизия `201c8afcccba`.
+* M5 (часть 5, гонка за последнюю пару): `_checkout_race_probe.py` → `ALL
+  CHECKOUT RACE CHECKS PASSED`, 3 прогона подряд стабильно; регрессия
+  `_orders_checkout_probe.py` и `_transaction_probe.py` — зелёные. Своя БД
+  `sneaker_race_<random>`, uvicorn в потоке пробы (порт 8001). Код приложения
+  не менялся, кроме комментария-заголовка `app/routers/order.py` (фраза
+  «списание остатка — следующий шаг» заменена актуальным описанием).
+  (1) `stock 101 = 1`; Аня и Борис (разные пользователи) положили 101 x1 —
+  `POST /cart/items` 200 у обоих (корзина остаток не резервирует). (2)
+  Checkout Ани выполнил все записи и запаркован hook-ом на стадии
+  `after_clear_cart` (до commit): в `pg_stat_activity` Аня `idle in
+  transaction`, последний оператор `DELETE FROM cart_items`; снаружи
+  (AUTOCOMMIT-наблюдатель) изменений не видно. (3) `POST /orders` Бориса:
+  `pg_blocking_pids(Борис) == [Аня]`, `wait_event_type=Lock`,
+  `wait_event=transactionid`, ждущий оператор — `SELECT … FROM product_sizes
+  … ORDER BY product_sizes.id FOR UPDATE OF product_sizes`; свой `users FOR
+  UPDATE` Борис уже прошёл (разные строки users — не конфликт); в `pg_locks`
+  Борис ждёт `ShareLock` на `transactionid` Ани, Аня держит на нём
+  `ExclusiveLock`. Доказательство — данные PostgreSQL, опрос каждые 20 мс с
+  пределом 2.5 с (< `lock_timeout` 3 с), а не sleep. (4) Аня отпущена → 201;
+  Борис просыпается, в READ COMMITTED перечитывает обновлённую строку и
+  получает 409 `Not enough stock for product size 101: requested 1,
+  available 0` (НЕ `concurrent_change_retry`); у Бориса ни одной записи.
+  Итог: `orders=1`, `order_items=1`, `stock 101 = 0` (не −1), заказ Ани,
+  корзина Ани пуста, корзина Бориса сохранена `[(101, 1)]`, `GET /cart`
+  Бориса показывает `stock=0`. (5) Перехваченный SQL Ани по порядку: `SET
+  TRANSACTION READ COMMITTED` → `SET LOCAL lock_timeout` → `SET LOCAL
+  statement_timeout` → `users FOR UPDATE` → `SELECT cart_items` →
+  `product_sizes FOR UPDATE ORDER BY id` → `products FOR SHARE ORDER BY id` →
+  `INSERT orders` → `INSERT order_items` → `UPDATE product_sizes SET stock =
+  stock - qty` → `DELETE cart_items`. (6) Deadlock с «другим сервисом»:
+  внешнее соединение (`SET LOCAL deadlock_timeout='10s'`, учётка `practice` —
+  superuser) держит `product_sizes` 101 `FOR UPDATE`; Борис берёт `users FOR
+  UPDATE` и ждёт размер; внешнее просит `users` Бориса `FOR UPDATE` → цикл.
+  Backend Бориса (`deadlock_timeout` 1 с) обнаруживает цикл → SQLSTATE
+  `40P01` (пойман слушателем `handle_error`) → 409 `concurrent_change_retry`,
+  данные не изменены; внешнее соединение затем получает строку. Повтор
+  клиентом → 201 (сервер сам не повторяет). Вывод: единый порядок блокировок
+  исключает deadlock только между операциями, которые его соблюдают; с чужим
+  кодом deadlock возможен и обрабатывается как 409.
 
 ## Чего ещё нет
 
@@ -1047,9 +1097,11 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
   есть; строка оставлена как след истории — актуально см. «Чего ещё нет»
   выше.)
 * Каскадного удаления и обработчиков покупки нет намеренно.
-* Не проверялись: конкурентное списание остатка, гонка при оформлении
-  (`POST /orders` сейчас не списывает stock, поэтому гонки за остаток ещё
-  не возникает), `ON DELETE` на практике, `alembic downgrade`.
+* Конкурентное списание остатка и гонка двух покупателей за последнюю пару
+  **проверены** (M5, часть 5, `_checkout_race_probe.py`): второй ждёт
+  `FOR UPDATE`, затем получает 409 `Not enough stock`, `stock` не уходит в
+  минус; deadlock с чужим кодом даёт 409 `concurrent_change_retry`.
+* Не проверялись: `ON DELETE` на практике, `alembic downgrade`.
 * В этом шаге НЕ перезапускались наборы M3 (`_write_matrix_probe.py`,
   `_m2_contract_review.py`, `_m3_review_probe.py`) и `_auth_*`: изменения
   M4 к ним не относятся (правки ровно в `app/app_factory.py` — новый
@@ -1149,10 +1201,9 @@ Checkout начат частично: **часть 1** (`POST /orders` — пр�
 * Сценарии статуса: обычный пользователь → 403, без токена → 401, админ →
   200, недопустимый статус (`'done'`, `'shipped'`) → 422, чужой и
   несуществующий заказ → 404, `is_admin=false` не помогает.
-* Дополнительно к checkout (часть 3) осталось непроверенным:
-  конкурентный checkout двух покупателей последней пары (настоящий
-  параллельный тест по правилу 19) — сейчас это возможно, потому что
-  остаток уже списывается под `FOR UPDATE`.
+* Конкурентный checkout двух покупателей последней пары (настоящий
+  параллельный тест по правилу 19) — **сделано в части 5**
+  (`_checkout_race_probe.py`, см. «Что уже проверено»).
 * Наблюдения после каждого отказа: `orders`/`order_items` не изменились,
   `cart_items` не изменились, `stock` не изменился.
 * Не забыть: `orders.total` ограничен `Numeric(12,2)` →
@@ -1309,3 +1360,16 @@ query-параметром: иначе клиент сможет ломать ch
     тест, удерживающий блокировку 4–5 с, получит 409 `concurrent_change_retry`
     (это и проверяется), а тест, которому нужно «просто подождать», должен
     укладываться в 3 с или использовать своё соединение без этих настроек.
+28. **Чтобы наблюдать ожидание блокировки через HTTP, сервер должен быть в
+    процессе пробы** (`uvicorn.Server` в потоке): тогда внутренний hook
+    (`shop._FAULT_HOOK`) может «запарковать» первую транзакцию перед commit.
+    Ожидание доказывается данными PostgreSQL: `pg_blocking_pids`,
+    `pg_stat_activity.wait_event_type='Lock'`, `pg_locks` (`ShareLock` на
+    `transactionid`). Окно наблюдения держать меньше `lock_timeout` сервиса
+    (3 с), иначе второй получит 55P03 (409 `concurrent_change_retry`) вместо
+    проверки остатка. Проверено в `_checkout_race_probe.py`.
+29. **Для воспроизводимого deadlock поднять `deadlock_timeout` у «чужого»
+    соединения** (`SET LOCAL deadlock_timeout`, нужен superuser) и замкнуть
+    цикл сразу после обнаружения ожидания сервиса — тогда жертвой
+    гарантированно станет транзакция сервиса (его `deadlock_timeout` 1 с
+    меньше), и проба увидит 40P01 → 409 `concurrent_change_retry`.

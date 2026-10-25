@@ -28,6 +28,23 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.query import Limit, Offset
+
+
+class OrderListParams(BaseModel):
+    """Query-параметры GET /orders: только страница, никаких фильтров.
+
+    `limit` 1..100 (по умолчанию 20) и `offset` >= 0 — те же типы, что у
+    каталога (app/schemas/query.py), поэтому `limit=0`, `limit=101`,
+    `offset=-1` и `limit=abc` дают 422 до обращения к БД. `extra="forbid"`
+    отвергает лишнее, например `?user_id=2`: владелец берётся только из токена.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: Limit = 20
+    offset: Offset = 0
+
 
 class OrderCreate(BaseModel):
     """Вход POST /orders: полей нет вообще.

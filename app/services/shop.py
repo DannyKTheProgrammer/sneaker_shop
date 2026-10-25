@@ -150,6 +150,12 @@ class OrderTotalConflict(ShopConflict):
     detail = "Order total exceeds the allowed maximum"
 
 
+class OrderNotFound(ShopNotFound):
+    """Заказа нет ИЛИ он принадлежит другому пользователю (404)."""
+
+    detail = "Order not found"
+
+
 class ConcurrentChangeConflict(ShopConflict):
     """Транзакцию прервала конкуренция: deadlock, конфликт, таймаут (409).
 
@@ -978,3 +984,77 @@ def _create_order(
         [(product_size_id, quantity, product.price)
          for product_size_id, product, quantity, _subtotal_value in prepared],
     )
+
+
+# --- история заказов (M5): GET /orders и GET /orders/{order_id} -----------
+#
+# Только чтение, поэтому замка владельца (users FOR UPDATE) здесь НЕТ:
+# история не меняет ни корзину, ни остаток, и ей незачем ждать параллельный
+# checkout того же пользователя. Сессия всё равно своя, через transaction():
+# те же READ COMMITTED и локальные таймауты, а DTO собирается ВНУТРИ блока —
+# пока сессия активна, поэтому ленивых запросов к закрытой сессии нет.
+#
+# selectinload(Order.items) даёт два оператора: SELECT orders ... и SELECT
+# order_items WHERE order_id IN (...). В READ COMMITTED у них разные снимки,
+# но это безопасно: позиции заказа после commit checkout не меняются, а
+# новый заказ, появившийся между операторами, в список уже не попадёт.
+
+
+def _order_read(order: Order) -> OrderRead:
+    """DTO заказа из ORM-объекта с загруженными items (вызывать в сессии).
+
+    Цена — `price_at_purchase` из order_items (снимок), а не текущая
+    `products.price`; `total` — снимок из orders. Позиции — по возрастанию
+    id: у relationship нет order_by, и selectinload порядок не обещает.
+    """
+    return OrderRead(
+        id=order.id,
+        status=order.status,
+        total=order.total,
+        created_at=order.created_at,
+        items=[
+            OrderItemRead(
+                product_size_id=item.product_size_id,
+                quantity=item.quantity,
+                price_at_purchase=item.price_at_purchase,
+                subtotal=item.price_at_purchase * item.quantity,
+            )
+            for item in sorted(order.items, key=lambda row: row.id)
+        ],
+    )
+
+
+def list_orders(user_id: int, limit: int, offset: int) -> list[OrderRead]:
+    """Свои заказы, новые первыми (ORDER BY id DESC), страница limit/offset.
+
+    `WHERE orders.user_id = :user_id` — единственный источник «чьи заказы»;
+    user_id приходит из проверенного токена. Пустая история — пустой список.
+    """
+    with transaction() as session:
+        orders = session.scalars(
+            select(Order)
+            .options(selectinload(Order.items))
+            .where(Order.user_id == user_id)
+            .order_by(Order.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+        return [_order_read(order) for order in orders]
+
+
+def get_order(user_id: int, order_id: int) -> OrderRead:
+    """Один свой заказ: id И user_id в одном WHERE (как _get_owned_item).
+
+    Чужой и несуществующий заказ неотличимы — оба OrderNotFound (404).
+    Администратор здесь не исключение: это личный маршрут, роль не
+    проверяется вовсе, чужие заказы он через него не видит.
+    """
+    with transaction() as session:
+        order = session.scalars(
+            select(Order)
+            .options(selectinload(Order.items))
+            .where(Order.id == order_id, Order.user_id == user_id)
+        ).one_or_none()
+        if order is None:
+            raise OrderNotFound()
+        return _order_read(order)
