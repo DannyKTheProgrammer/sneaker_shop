@@ -25,10 +25,27 @@
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from app.schemas.query import Limit, Offset
+
+# Ровно те значения, что разрешает CHECK ck_order_status из миграции M1.
+# Любое другое ('done', 'shipped', 'CREATED', null) — 422 до обращения к БД.
+OrderStatus = Literal["created", "processing", "completed"]
+
+
+class OrderStatusUpdate(BaseModel):
+    """Тело PATCH /orders/{order_id}/status: только новый статус.
+
+    `extra="forbid"`: прислать заодно `total`, `items` или `user_id` нельзя —
+    смена статуса не редактирует заказ, это 422.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: OrderStatus
 
 
 class OrderListParams(BaseModel):

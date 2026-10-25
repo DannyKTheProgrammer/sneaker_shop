@@ -46,6 +46,13 @@ class ShopNotFound(ShopError):
     detail = "Not found"
 
 
+class ShopForbidden(ShopError):
+    """Пользователь известен, но прав на операцию нет (403)."""
+
+    status_code = HTTPStatus.FORBIDDEN
+    detail = "Administrator privileges required"
+
+
 class ShopConflict(ShopError):
     """Запрос корректен по форме, но состояние данных его не допускает."""
 

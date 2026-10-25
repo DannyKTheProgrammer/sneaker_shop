@@ -1,4 +1,5 @@
-# Маршруты заказа (M5): POST /orders, GET /orders, GET /orders/{order_id}.
+# Маршруты заказа (M5): POST /orders, GET /orders, GET /orders/{order_id},
+# PATCH /orders/{order_id}/status (администратор).
 #
 # POST /orders — маршрут САМОГО пользователя (как корзина), без
 # require_admin: заказ оформляет тот, кто предъявил токен. Владелец и цены
@@ -17,8 +18,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Path, Query, status
 
-from app.routers.auth import get_current_user_id
-from app.schemas.order import OrderCreate, OrderListParams, OrderRead
+from app.routers.auth import AdminUser, get_current_user_id
+from app.schemas.order import OrderCreate, OrderListParams, OrderRead, OrderStatusUpdate
 from app.services import shop as shop_service
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -69,6 +70,35 @@ def get_order(order_id: OrderId, user_id: CurrentUserId) -> OrderRead:
     тоже не видит.
     """
     return shop_service.get_order(user_id, order_id)
+
+
+@router.patch(
+    "/{order_id}/status",
+    response_model=OrderRead,
+    summary="Сменить статус заказа (только администратор)",
+    responses={
+        200: {"description": "Статус сменён, или он уже был таким (без изменений)"},
+        401: {"description": "Токен отсутствует или недействителен"},
+        403: {"description": "Пользователь не администратор"},
+        404: {"description": "Заказа нет"},
+        409: {"description": "Переход не разрешён: пропуск шага или обратный ход"},
+        422: {"description": "Неизвестный статус, лишнее поле, тело не JSON, плохой id"},
+    },
+)
+def update_order_status(
+    order_id: OrderId,
+    payload: OrderStatusUpdate,
+    admin: AdminUser,
+) -> OrderRead:
+    """Учебное правило: `created → processing → completed`, только вперёд.
+
+    Повтор текущего статуса — 200 без записи; пропуск и обратный ход — 409.
+    `require_admin` отсекает не-администратора (403) ещё в auth-сессии;
+    в сервис уходит только `admin.id`, и там роль перечитывается в свежей
+    транзакции (`users FOR SHARE`) перед `orders FOR UPDATE`. Остаток,
+    позиции заказа и корзина не меняются.
+    """
+    return shop_service.update_order_status(admin.id, order_id, payload.status)
 
 
 @router.post(

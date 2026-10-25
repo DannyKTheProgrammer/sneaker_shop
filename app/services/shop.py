@@ -43,7 +43,7 @@ from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.errors import ShopConflict, ShopError, ShopNotFound
+from app.core.errors import ShopConflict, ShopError, ShopForbidden, ShopNotFound
 from app.database import SessionLocal
 from app.models import CartItem, Order, OrderItem, Product, ProductSize, User
 from app.schemas.cart import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
@@ -154,6 +154,12 @@ class OrderNotFound(ShopNotFound):
     """Заказа нет ИЛИ он принадлежит другому пользователю (404)."""
 
     detail = "Order not found"
+
+
+class OrderStatusConflict(ShopConflict):
+    """Переход статуса не разрешён учебным правилом (409)."""
+
+    detail = "Order status transition is not allowed"
 
 
 class ConcurrentChangeConflict(ShopConflict):
@@ -1057,4 +1063,73 @@ def get_order(user_id: int, order_id: int) -> OrderRead:
         ).one_or_none()
         if order is None:
             raise OrderNotFound()
+        return _order_read(order)
+
+
+# --- смена статуса заказа (M5): PATCH /orders/{order_id}/status ---------------
+#
+# УЧЕБНОЕ правило (уточнение контракта, а не требование любого магазина):
+# только вперёд и только на один шаг — created -> processing -> completed.
+# Повтор текущего статуса — 200 без записи (запрос можно безопасно
+# повторить); пропуск шага и обратный ход — 409.
+#
+# Порядок блокировок:
+#   1. users FOR SHARE (строка администратора) — роль перечитывается В ЭТОЙ
+#      транзакции. require_admin проверил её раньше, в auth-сессии; между
+#      той проверкой и нашей записью роль могли снять. FOR SHARE не мешает
+#      другим читателям, но не даёт UPDATE users (снятию роли) пройти до
+#      нашего commit — решение «можно» остаётся верным до фиксации;
+#   2. orders FOR UPDATE — два одновременных PATCH одного заказа встают в
+#      очередь, и второй проверяет переход уже от зафиксированного статуса
+#      первого (READ COMMITTED: новый оператор — новый снимок).
+#
+# Остаток, order_items и корзина здесь не читаются и не меняются: заказ уже
+# оформлен, списание сделал checkout. Строка products/product_sizes не
+# блокируется, поэтому смена статуса не ждёт покупателей.
+
+ORDER_STATUS_NEXT = {"created": "processing", "processing": "completed"}
+
+
+def _lock_admin_for_share(session: Session, admin_id: int) -> None:
+    """Шаг 1: перечитать роль под FOR SHARE; не администратор → 403.
+
+    Строки нет (аккаунт удалили после проверки токена) — тоже 403: прав на
+    операцию у этого запроса нет. Сравнение строго `is True`, как в
+    require_admin: NULL в колонке доступа не даёт.
+    """
+    is_admin = session.execute(
+        select(User.is_admin)
+        .where(User.id == admin_id)
+        .with_for_update(of=User, read=True)
+    ).scalar_one_or_none()
+    if is_admin is not True:
+        raise ShopForbidden()
+
+
+def update_order_status(admin_id: int, order_id: int, new_status: str) -> OrderRead:
+    """Сменить статус любого заказа (администратор), своя транзакция.
+
+    Возвращает заказ целиком (как GET /orders/{id}); DTO собирается в
+    активной сессии, до commit на выходе из `transaction()`.
+    """
+    with transaction() as session:
+        _lock_admin_for_share(session, admin_id)
+
+        order = session.scalars(
+            select(Order)
+            .options(selectinload(Order.items))
+            .where(Order.id == order_id)
+            .with_for_update(of=Order)
+        ).one_or_none()
+        if order is None:
+            raise OrderNotFound()
+
+        if new_status != order.status:
+            if ORDER_STATUS_NEXT.get(order.status) != new_status:
+                raise OrderStatusConflict(
+                    f"Order status transition {order.status} -> {new_status} is not allowed"
+                )
+            order.status = new_status
+            session.flush()
+        # Повтор текущего статуса: ни UPDATE, ни flush — ответ 200 «как есть».
         return _order_read(order)
