@@ -12,7 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core.security import InvalidToken, create_access_token, decode_access_token
-from app.database import get_session
+from app.database import SessionLocal, get_session
 from app.models import User
 from app.schemas.auth import TokenResponse, UserLogin, UserRead, UserRegister
 from app.services import auth as auth_service
@@ -38,10 +38,36 @@ def _unauthorized(detail: str = "Could not validate credentials") -> HTTPExcepti
     )
 
 
-def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
-    session: SessionDep,
-) -> User:
+def _forbidden() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Administrator privileges required",
+    )
+
+
+BearerCredentials = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]
+
+
+def _user_from_token(credentials: HTTPAuthorizationCredentials | None, session: Session) -> User:
+    """Проверить Bearer-токен и прочитать его пользователя в переданной сессии.
+
+    Общая часть get_current_user и зависимостей «только id» ниже: отличаются
+    они лишь тем, чья это сессия и когда она закрывается.
+    """
+    if credentials is None or not credentials.credentials:
+        raise _unauthorized("Not authenticated")
+    try:
+        user_id = decode_access_token(credentials.credentials)
+    except InvalidToken as exc:
+        raise _unauthorized() from exc
+
+    user = auth_service.get_user_by_id(session, user_id)
+    if user is None:
+        raise _unauthorized()
+    return user
+
+
+def get_current_user(credentials: BearerCredentials, session: SessionDep) -> User:
     """Пользователь из access token.
 
     Шаги:
@@ -60,38 +86,56 @@ def get_current_user(
 
     Побочный эффект, который нам и нужен: изменение роли в БД действует
     на следующем же запросе с уже выданным токеном — перевыпуск не нужен.
-    """
-    if credentials is None or not credentials.credentials:
-        raise _unauthorized("Not authenticated")
-    try:
-        user_id = decode_access_token(credentials.credentials)
-    except InvalidToken as exc:
-        raise _unauthorized() from exc
 
-    user = auth_service.get_user_by_id(session, user_id)
-    if user is None:
-        raise _unauthorized()
-    return user
+    Сессия здесь — из Depends(get_session) и живёт до конца запроса. Это
+    годится там, где той же сессией дальше работает сам маршрут (/auth/me,
+    запись каталога). Для корзины и заказов — см. get_current_user_id.
+    """
+    return _user_from_token(credentials, session)
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def get_current_user_id(current_user: CurrentUser) -> int:
-    """Только id пользователя из проверенного токена (M4: корзина).
+def get_current_user_id(credentials: BearerCredentials) -> int:
+    """Только id пользователя из проверенного токена (корзина и заказы).
 
-    Отличие от get_current_user ровно одно: наружу уходит не ORM-объект, а
-    целое число. Причина техническая, а не косметическая: строка User
-    принадлежит сессии зависимости get_session, а бизнес-операции корзины и
-    checkout работают в СВОЕЙ свежей сессии (см. app/services/shop.py).
-    Передавать туда ORM-объект из чужой сессии нельзя: чтение его атрибутов
-    может неожиданно пойти в старую транзакцию со старым снимком.
+    Наружу уходит не ORM-объект, а целое число: бизнес-операции корзины и
+    checkout работают в СВОЕЙ свежей сессии (см. app/services/shop.py), и
+    передавать туда объект из чужой сессии нельзя — чтение его атрибутов
+    может пойти в старую транзакцию со старым снимком.
+
+    Пользователь читается в КОРОТКОЙ сессии, которая закрывается до вызова
+    сервиса: close() откатывает её неявную транзакцию и возвращает соединение
+    в пул. Раньше здесь была сессия из Depends(get_session), и она держала
+    второе соединение «idle in transaction» до конца запроса. Под параллельной
+    нагрузкой запросы занимали весь пул первыми соединениями и падали 500 по
+    pool_timeout, ожидая второе (дефект D1). Теперь в каждый момент запрос
+    держит не больше одного соединения.
 
     Проверка токена при этом не ослабляется: id берётся из строки users,
     прочитанной из БД по sub токена, то есть удалённый пользователь получит
-    401 ещё здесь.
+    401 ещё здесь. Блокировку строки владельца сервис берёт заново, в своей
+    транзакции.
     """
-    return current_user.id
+    with SessionLocal() as session:
+        return _user_from_token(credentials, session).id
+
+
+def get_current_admin_id(credentials: BearerCredentials) -> int:
+    """id администратора из проверенного токена; иначе 401/403.
+
+    То же, что get_current_user_id, плюс проверка роли — для маршрутов, где
+    дальше работает сервис в своей сессии (PATCH /orders/{id}/status).
+    Сессия закрывается до вызова сервиса, а сервис перечитывает роль под
+    users FOR SHARE в своей транзакции: проверка здесь — ранний отказ 403,
+    решающая — там.
+    """
+    with SessionLocal() as session:
+        user = _user_from_token(credentials, session)
+        if user.is_admin is not True:
+            raise _forbidden()
+        return user.id
 
 
 def require_admin(current_user: CurrentUser) -> User:
@@ -106,10 +150,7 @@ def require_admin(current_user: CurrentUser) -> User:
     (схема разошлась с ожиданием), доступ всё равно будет закрыт.
     """
     if current_user.is_admin is not True:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator privileges required",
-        )
+        raise _forbidden()
     return current_user
 
 

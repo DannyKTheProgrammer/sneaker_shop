@@ -18,13 +18,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Path, Query, status
 
-from app.routers.auth import AdminUser, get_current_user_id
+from app.routers.auth import get_current_admin_id, get_current_user_id
 from app.schemas.order import OrderCreate, OrderListParams, OrderRead, OrderStatusUpdate
 from app.services import shop as shop_service
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 CurrentUserId = Annotated[int, Depends(get_current_user_id)]
+CurrentAdminId = Annotated[int, Depends(get_current_admin_id)]
 
 # Границы int4, как у ItemId корзины: orders.id — Integer.
 OrderId = Annotated[int, Path(ge=1, le=2147483647, description="id заказа")]
@@ -88,17 +89,18 @@ def get_order(order_id: OrderId, user_id: CurrentUserId) -> OrderRead:
 def update_order_status(
     order_id: OrderId,
     payload: OrderStatusUpdate,
-    admin: AdminUser,
+    admin_id: CurrentAdminId,
 ) -> OrderRead:
     """Учебное правило: `created → processing → completed`, только вперёд.
 
     Повтор текущего статуса — 200 без записи; пропуск и обратный ход — 409.
-    `require_admin` отсекает не-администратора (403) ещё в auth-сессии;
-    в сервис уходит только `admin.id`, и там роль перечитывается в свежей
-    транзакции (`users FOR SHARE`) перед `orders FOR UPDATE`. Остаток,
-    позиции заказа и корзина не меняются.
+    `get_current_admin_id` отсекает не-администратора (403) в короткой
+    auth-сессии, которая закрывается до вызова сервиса; в сервис уходит
+    только id, и там роль перечитывается в свежей транзакции
+    (`users FOR SHARE`) перед `orders FOR UPDATE`. Остаток, позиции заказа
+    и корзина не меняются.
     """
-    return shop_service.update_order_status(admin.id, order_id, payload.status)
+    return shop_service.update_order_status(admin_id, order_id, payload.status)
 
 
 @router.post(
@@ -126,8 +128,8 @@ def create_order(
 
     Что происходит внутри (порядок важен):
 
-    1. новая сессия на операцию (авторизация уже открыла свою транзакцию
-       чтением User — сюда она не «переезжает»);
+    1. новая сессия на операцию (авторизация прочитала User в своей
+       короткой сессии и уже закрыла её — сюда приходит только id);
     2. `users FOR UPDATE`;
     3. читается состав корзины; пустая корзина → 409 `Cart is empty`;
     4. `product_sizes FOR UPDATE` по возрастанию id;
