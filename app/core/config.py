@@ -38,6 +38,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        # Не печатать присланные значения в тексте ValidationError: иначе при
+        # ошибке конфигурации (короткий ключ, нет DATABASE_URL) в консоль и
+        # логи попадает сам JWT_SECRET или его начало и конец (input_value).
+        hide_input_in_errors=True,
     )
 
     # Обязательное поле: если DATABASE_URL ни в окружении, ни в .env,
