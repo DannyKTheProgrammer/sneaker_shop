@@ -22,6 +22,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from app.schemas.money import DecimalStr
+
 # id строки product_sizes: Integer в PostgreSQL = 32 бита.
 PrimaryKey = Annotated[StrictInt, Field(ge=1, le=2147483647)]
 
@@ -105,20 +107,17 @@ class CartItemRead(BaseModel):
     знаками из numeric(10,2), поэтому произведение точное.
     """
 
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_encoders={Decimal: lambda value: format(value, "f")},
-    )
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     product_size_id: int
     product_id: int
     name: str
-    size: Decimal
-    price: Decimal
+    size: DecimalStr
+    price: DecimalStr
     quantity: int
     stock: int
-    subtotal: Decimal
+    subtotal: DecimalStr
 
 
 class CartRead(BaseModel):
@@ -133,18 +132,12 @@ class CartRead(BaseModel):
       сама по себе (например, администратор поднял цену) либо при
       оформлении заказа — поэтому и называется оценкой, а не «итогом».
 
-    Собственного json_encoders у вложенных CartItemRead достаточно для их
-    Decimal-полей, но estimated_total относится к этой модели, поэтому
-    энкодер объявлен и здесь: без него Decimal ушёл бы числом, а не
-    строкой, и точность в JSON стала бы зависеть от клиента.
+    `estimated_total` — тоже `DecimalStr` (app/schemas/money.py): строка
+    "7990.00" в JSON, чтобы точность не зависела от клиента.
 
     `from_attributes` здесь не нужен: объект собирается в коде сервиса из
     строк JOIN-запроса, а не из ORM-объекта одного вида.
     """
 
-    model_config = ConfigDict(
-        json_encoders={Decimal: lambda value: format(value, "f")},
-    )
-
     items: list[CartItemRead]
-    estimated_total: Decimal
+    estimated_total: DecimalStr

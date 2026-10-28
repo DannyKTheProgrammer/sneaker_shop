@@ -109,7 +109,7 @@ def build_app(*, include_writes: bool) -> FastAPI:
         вернулся бы клиенту в поле input.
         """
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": _redact_validation_errors(exc.errors())},
         )
 

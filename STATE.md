@@ -5,16 +5,22 @@
 латиницей, это не считается переходом на английский.
 
 Файл для быстрого входа в контекст (в том числе в новой сессии агента).
-Обновляется после каждого значимого шага. Последнее обновление: M5, часть 5
-— гонка двух покупателей за последнюю пару проверена наблюдаемым тестом
-блокировок (`_checkout_race_probe.py`); код приложения не менялся (версия
-API остаётся `0.11.0`). Предыдущий шаг (часть 4): транзакционный слой —
-сервис НЕ делает `begin()` в auth-сессии (там autobegin уже открыл
-транзакцию), а открывает свою `SessionLocal.begin()` через
-`shop.transaction()`: READ COMMITTED задаётся до чтений, локальные
-`lock_timeout=3s`/`statement_timeout=5s`, один commit на выходе, rollback при
-любом исключении, а SQLSTATE 40P01/40001/55P03/57014 превращаются в 409
-`concurrent_change_retry` (прочие ошибки не маскируются).
+Обновляется после каждого значимого шага. Последнее обновление: **M6 —
+подготовка к проверке** (2026-10-28): финальная точка входа
+`app.final_main:app`, README, полный закреплённый `requirements.txt`,
+выдача роли `app.promote_admin`, исправлен дефект пула D1 (запрос корзины и
+заказа держал два соединения → 500 под нагрузкой) и пункты итогового ревью
+M6. Версия API `0.13.0`. Итоги, статус дефектов и что не проверялось — в
+разделе «M6: подготовка к проверке» ниже.
+
+Транзакционный слой (M5, часть 4) не менялся: сервис открывает свою
+`SessionLocal.begin()` через `shop.transaction()`: READ COMMITTED задаётся
+до чтений, локальные `lock_timeout=3s`/`statement_timeout=5s`, один commit на
+выходе, rollback при любом исключении, а SQLSTATE 40P01/40001/55P03/57014
+превращаются в 409 `concurrent_change_retry` (прочие ошибки не маскируются).
+С M6 пользователя для корзины и заказов читает КОРОТКАЯ сессия авторизации,
+которая закрывается до вызова сервиса (`get_current_user_id`,
+`get_current_admin_id`).
 
 Инфраструктура: Docker Desktop должен быть запущен — без него PostgreSQL на
 `127.0.0.1:55433` недоступен, и проверить ничего нельзя (в части 2 так и
@@ -22,8 +28,11 @@ API остаётся `0.11.0`). Предыдущий шаг (часть 4): тр
 
 Данные ученика в рабочей БД: `users` — три строки (`danny@gmail.com`,
 `admin@example.com` и `danny@gmail.comm`, созданная вручную в его
-приложении на 8000). `cart_items` пуст; `orders=0`, `order_items=0`. Его
-данные не удалять и не считать мусором проверок.
+приложении на 8000). `cart_items` пуст; **`orders=1`, `order_items=2`**:
+заказ `id=1` (`user_id=4`, 101×2 + 201×1, `21970.00`, статус `created`)
+ученик создал сам 2026-10-28 в 12:09 (местное время), отлаживая
+`POST /orders` в VS Code; поэтому остатки 101=1, 201=4. Его данные не
+удалять и не считать мусором проверок.
 
 Реквизиты ниже (`practice` / `practice-only`) — вымышленные учебные, они
 же лежат в `.env.example`. Настоящих секретов в этом файле быть не должно.
@@ -54,54 +63,143 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
 * В рабочей БД 8 таблиц: семь приложения (`brands`, `products`,
   `product_sizes`, `users`, `cart_items`, `orders`, `order_items`)
   плюс служебная `alembic_version`.
-* Данные в рабочей БД: `brands=2`, `products=3`, `product_sizes=4`,
-  `orders=0`, `order_items=0`; в `users` — три записи, созданные учеником
-  вручную (`danny@gmail.com`, `admin@example.com`, `danny@gmail.comm`);
-  `cart_items=0` (свою тестовую строку ученик удалил сам). Это не мусор
-  проверок: не удалять и не строить на «пустой рабочей БД» никаких
-  утверждений (см. правило 17).
+* Данные в рабочей БД (2026-10-28): `brands=2`, `products=3`,
+  `product_sizes=4` (stock 101=1, 102=0, 201=4, 301=2), `orders=1`,
+  `order_items=2`; в `users` — три записи, созданные учеником вручную
+  (`danny@gmail.com`, `admin@example.com`, `danny@gmail.comm`);
+  `cart_items=0`. Заказ и изменённые остатки — от отладки ученика. Это не
+  мусор проверок: не удалять и не строить на «пустой рабочей БД» никаких
+  утверждений (см. правило 17). Неизменность рабочей БД в проверках
+  доказывается отпечатком (md5 всех семи таблиц) до и после прогона.
 * Временных учебных БД нет (в кластере только `postgres`, `sneaker_shop`,
   `template0`, `template1`).
-* API: две точки входа.
-  `app.store_main:app` (он же `app.main:app`) — **результат M3 + шаги M4/M5**,
-  версия `0.11.0`: чтение каталога, регистрация/вход/JWT, запись каталога
-  (`POST /products`, `PUT /products/{id}`, `DELETE /products/{id}`) под
-  `require_admin`, корзина пользователя (`POST /cart/items`, `GET /cart`,
-  `PATCH /cart/items/{item_id}`, `DELETE /cart/items/{item_id}`) и
-  `POST /orders` (заказ одной транзакцией: снимок цен, списание остатка,
-  очистка корзины, `201`) под обычной аутентификацией.
+* API: точки входа.
+  `app.final_main:app` — **финальная (M6)**, та же сборка, что
+  `app.store_main:app` и `app.main:app` (`build_app(include_writes=True)`),
+  версия `0.13.0`: чтение каталога, регистрация/вход/JWT, `GET /auth/me`,
+  запись каталога (`POST /products`, `PUT /products/{id}`,
+  `DELETE /products/{id}`) под `require_admin`, корзина пользователя
+  (`POST /cart/items`, `GET /cart`, `PATCH /cart/items/{item_id}`,
+  `DELETE /cart/items/{item_id}`), заказы (`POST /orders` — одна транзакция:
+  снимок цен, списание остатка, очистка корзины, `201`; `GET /orders`,
+  `GET /orders/{order_id}`) и `PATCH /orders/{order_id}/status`
+  (администратор, `created → processing → completed`, без повторного
+  списания). В OpenAPI **19 пар** method+path: 18 маршрутов магазина плюс
+  вспомогательный `GET /auth/admin-check` (M3); README перечисляет все 19.
   `app.catalog_main:app` — **контрольная точка M2**, версия `0.2.0`:
   те же чтение и auth, но маршрутов записи каталога нет (405), а корзины
   нет вовсе (404 — маршрут не зарегистрирован).
   У `/products` есть фильтры и пагинация: `brand_id`, `min_price`,
   `max_price`, `size`, `search`, `limit` (20, макс 100), `offset`.
 * Порт 8000: ученик держит на нём СВОЁ приложение разработки
-  (`python -m uvicorn app.main:app --reload --port 8000`, системный Python и
-  reload-воркер). Это не осиротевший процесс, убивать его не нужно: для
+  (`python -m uvicorn app.main:app --reload --port 8000` или, с M6, отладчик
+  VS Code — `.vscode/launch.json`, `app.final_main:app` на 8000, без
+  `--reload`). Это не осиротевший процесс, убивать его не нужно: для
   приёмки берём другой порт (8001 — store_main, 8002 — catalog_main) и
   СВОЮ временную БД. Контейнер `db` запущен и healthy.
+
+## M6: подготовка к проверке (2026-10-28)
+
+**Сделано:** `requirements.txt` — полный закреплённый стек (43 пакета, без
+обновлений); `config.py` без запасных значений секретов,
+`hide_input_in_errors`, `database_url` скрыт из repr; `app/final_main.py`;
+`app/promote_admin.py`; `README.md`; исправлен D1 (пул); итоговое ревью M6.
+
+**Коммиты ученика:** `3f9ce2e` README/final_main/promote_admin, `ad8098d`
+плагин отладчика, `4bb4a11` исправление D1 (auth-сессия). Правки по
+ревью (B2, N1–N6, `app/schemas/money.py`) на момент записи **не
+закоммичены**.
+
+**Соответствие файлов эталону (переименовывать не нужно):**
+`dependencies.py` → зависимости в `app/routers/auth.py`;
+`services/unit_of_work.py` → `shop.transaction()`;
+`alembic/versions/0001_initial.py` → `201c8afcccba_initial.py`
+(переименование сломало бы `alembic_version`).
+
+**Статус дефектов и пунктов ревью:**
+
+| № | Суть | Статус |
+|---|---|---|
+| D1 | запрос корзины/заказа держал 2 соединения пула → 500 под нагрузкой | **исправлено** (короткая auth-сессия); N=20 → 20×200, N=40 → 40×200 |
+| D2 | нет Idempotency-Key | **не исправляется** — честное ограничение, в README |
+| D3 | `GET /cart` берёт `users FOR UPDATE` | **оставлено намеренно**: ждёт начатые изменения владельца (`shop.py`, docstring `_get_cart`); на этом построен и эксперимент D1 |
+| D4 | `orders FOR UPDATE` вместо `FOR NO KEY UPDATE` | **оставлено**: разница только для вставки `order_items` в существующий заказ, такой операции нет; `_order_status_probe` проверяет этот SQL |
+| D5 / N4 | устаревшие `json_encoders` и `HTTP_422_UNPROCESSABLE_ENTITY` | **исправлено**: `DecimalStr`, `HTTP_422_UNPROCESSABLE_CONTENT`; предупреждений при импорте 8 → 0 |
+| D6 | `_seed_probe` ждал «рабочая БД пуста» | **исправлено** (before == after), зелёная в регрессии |
+| B2 | OpenAPI 19 пар, а карта README — 18 | **исправлено в README**: добавлен `GET /auth/admin-check`, маршрут не удалялся (на нём три пробы) |
+| N1 | docstring `POST /orders` «DTO до закрытия сессии» | **исправлено**: после закрытия, как в коде |
+| N2 | устаревший docstring `get_session` | **исправлено** |
+| N3 | `requirements-m3.txt` неполный | **помечен** ASCII-комментарием «устарел» |
+| N5 | пароль БД в `repr(settings)` | **исправлено**: `Field(repr=False)` |
+| N6 | регрессия гоняла `TRUNCATE … ROLLBACK` на рабочей БД; две пробы требовали имя `sneaker_shop` | **исправлено** (только пробы): проба фильтров — на временной БД регрессии; проверка «своя временная БД удалена» |
+| N7 | `pydevd_plugins/` не отслеживался | **решено учеником**: закоммичен |
+
+**Проверено фактически:**
+* чистая копия без `.env`/`.venv`: новый venv (Python 3.12.3, pip 24.0),
+  43/43 пакета, `pip check` чистый, новый `JWT_SECRET`, новая пустая БД,
+  `alembic upgrade head` через CLI, `heads`/`current` = `201c8afcccba`,
+  7 таблиц, seed дважды (каталог совпал), `uvicorn app.final_main:app`,
+  `/health`, `/docs`, OpenAPI, админ через `promote_admin`, покупка
+  101×2 + 201×1 → 201 `21970.00`, статус 403/200 без повторного списания;
+* `git clone` HEAD: все файлы README в репозитории, импорт `final_main`;
+* после всех правок: `_regression_probe.py` → `REGRESSION PASSED` (31/31),
+  `_error_contract_probe.py` → 149/0, рабочая БД не изменилась (отпечаток),
+  ответы и OpenAPI Decimal-полей до/после замены совпали.
+
+**Важно про Docker в этой проверке:** сервер Docker и контейнер уже были
+запущены; «новая пустая БД» создавалась `createdb` на готовом сервере. Это
+не равно установке Docker и первому старту контейнера с пустым томом.
+
+**Не проверялось:** Python 3.13 (не установлен; задание его называет) и
+3.11; macOS/Linux; bash-команды venv и `curl` из README (PowerShell-блок
+регистрации только разобран парсером); установка Docker на новом
+компьютере; строки таблицы ошибок README про занятые порты, `connection
+refused`, отсутствие `.env` для Compose; нагрузка больше N=40; полный
+секрет-скан истории Git (был только точечный поиск: `.env` в истории нет,
+значения `JWT_SECRET` нет); чистый запуск README на копии ПОСЛЕ правок
+ревью не повторялся (изменился только текст README, остальное — регрессия).
+
+**Повторная проверка:**
+```powershell
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _regression_probe.py        # REGRESSION PASSED
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 _error_contract_probe.py    # ALL ERROR CONTRACT CHECKS PASSED
+.\sneaker_shop_.venv\Scripts\python.exe -X utf8 -W always -c "import app.final_main"   # без Warning
+```
+Эксперимент D1 (`pool_experiment.py N HOLD`) и скрипт чистого запуска
+(`fresh_check.py`) лежали во временной папке сессии агента (scratchpad) и
+могут исчезнуть; в репозитории их нет.
 
 ## Структура проекта
 
 ```
 compose.yaml            сервис db (postgres:17), healthcheck pg_isready, том pgdata
 .env / .env.example     вымышленные реквизиты practice / practice-only, DATABASE_URL
-requirements.txt        зафиксированные fastapi, uvicorn, pydantic, SQLAlchemy, psycopg[binary], alembic, pydantic-settings, python-dotenv
+README.md               (M6) инструкция первого запуска: venv, pip, .env, setup_jwt, compose, alembic,
+                        seed, uvicorn app.final_main:app, админ, карта API (19 пар), остановка, ошибки
+requirements.txt        (M6) ПОЛНЫЙ закреплённый стек: pip freeze venv проекта, 43 пакета; первая строка
+                        `# -*- coding: utf-8 -*-` (иначе pip на Windows читает cp1251 и падает)
+requirements-m3.txt     УСТАРЕЛ и неполный (нет pydantic-settings): помечен ASCII-комментарием, не использовать
 alembic.ini             конфиг Alembic БЕЗ строки подключения (секретов нет)
 alembic/env.py          URL берётся из Config.set_main_option, иначе из settings
 alembic/versions/201c8afcccba_initial.py   единственная ревизия: семь таблиц
-app/app_factory.py      build_app(include_writes=...) — общая сборка: health, роутеры,
-                        обработчики 422 и ShopError
-app/store_main.py       app = build_app(include_writes=True)  — результат M3 + M4
+app/app_factory.py      build_app(include_writes=...) — общая сборка: health (503 при SQLAlchemyError),
+                        роутеры, обработчики 422 (HTTP_422_UNPROCESSABLE_CONTENT) и ShopError; версия 0.13.0
+app/final_main.py       (M6) app = build_app(include_writes=True) — ФИНАЛЬНАЯ точка входа из README
+app/promote_admin.py    (M6) python -m app.promote_admin --email X: UPDATE users SET is_admin=true
+                        (email strip+lower; rc 0 — выдана/уже была, 1 — нет пользователя; секретов не печатает)
+app/store_main.py       app = build_app(include_writes=True)  — результат M3–M5 (та же сборка)
 app/catalog_main.py     app = build_app(include_writes=False) — контрольная точка M2
 app/main.py             app = build_app(include_writes=True)  — совместимость с прежними командами запуска
-app/core/config.py      load_dotenv(override=False); Settings: database_url и jwt_secret (SecretStr, оба обязательны),
-                        jwt_algorithm=HS256, jwt_expire_minutes=15, jwt_issuer/audience
+app/core/config.py      load_dotenv(override=False); Settings: database_url (str, Field(repr=False) — пароль БД
+                        не виден в repr) и jwt_secret (SecretStr, ≥32 символов), оба обязательны, без значений
+                        по умолчанию; hide_input_in_errors=True (ValidationError не печатает значения);
+                        jwt_algorithm только HS256, jwt_expire_minutes=15, jwt_issuer/audience
 app/core/errors.py      ShopError (+ ShopNotFound 404, ShopConflict 409) и shop_error_handler:
                         в ответ уходит только detail — без SQL, имён ограничений и traceback
-app/database.py         один Engine, фабрика Session, ping() с SELECT 1
-app/main.py             FastAPI + GET /health + lifespan; подключает роутеры каталога и auth,
-                        плюс обработчик 422 с маскировкой input/ctx (пароль не утекает)
+app/database.py         один Engine (pool_size 5 + max_overflow 10, pool_timeout 3 c, statement_timeout 3000 мс),
+                        SessionLocal, get_session (каталог, register/login, /auth/me), ping() с SELECT 1
+app/schemas/money.py    (M6) DecimalStr = Decimal + PlainSerializer(format(v,"f"), только JSON) + WithJsonSchema
+                        (тот же pattern, что у Pydantic): замена устаревшего json_encoders без изменения ответов
 app/schemas/catalog.py  Pydantic-схемы: BrandRead, ProductSizeRead, ProductRead (чтение) и ProductWrite (вход записи)
 app/schemas/cart.py     CartItemAdd (вход: product_size_id + quantity, StrictInt 1..2147483647, extra=forbid),
                         CartItemUpdate (вход PATCH: только quantity, абсолютное значение),
@@ -165,12 +263,20 @@ app/routers/order.py    POST /orders — СОЗДАЁТ заказ (201 + OrderR
                         / concurrent_change_retry
 app/routers/auth.py     POST /auth/register (201/409/422), POST /auth/login (200/401/422),
                         GET /auth/me (200/401), GET /auth/admin-check (200/401/403);
-                        HTTPBearer + get_current_user/CurrentUser, get_current_user_id и require_admin/AdminUser
+                        HTTPBearer; _user_from_token (общая проверка токена + чтение users);
+                        get_current_user/CurrentUser и require_admin/AdminUser — в сессии запроса (get_session),
+                        для /auth/me, admin-check и записи каталога;
+                        (M6, D1) get_current_user_id и get_current_admin_id — КОРОТКАЯ сессия
+                        `with SessionLocal()`, закрыта до вызова сервиса, наружу только int:
+                        корзина, заказы и PATCH /orders/{id}/status держат не больше одного соединения
 setup_jwt.py            генерация JWT_SECRET в .env без перезаписи существующего ключа
 app/models/base.py      единственный DeclarativeBase
 app/models/entities.py  семь моделей: Brand, Product, ProductSize, User, CartItem, Order, OrderItem
 app/models/__init__.py  экспорт Base и семи моделей
 app/seed.py             python -m app.seed: идемпотентный каталог (2/3/4)
+pydevd_plugins/         плагин отладчика VS Code (debugpy): показывает только поля ORM/Pydantic;
+                        приложение его не импортирует (закоммичен учеником, ad8098d)
+.vscode/launch.json     конфигурация отладки (в .gitignore): app.final_main:app на 8000, variablePresentation
 prompts/                тексты заданий модулей + этот файл
 ```
 
@@ -188,8 +294,13 @@ prompts/                тексты заданий модулей + этот ф
 `_cart_get_acceptance.ps1`, `_cart_get_fixtures.py`, `_cart_isolation_probe.py`,
 `_cart_patch_delete_probe.py`, `_cart_duplicate_probe.py`, `_m4_review_probe.py`,
 `_orders_checkout_probe.py`, `_transaction_probe.py`,
-`_checkout_race_probe.py`, `_pg_admin.py`,
-`check_env.py`, `sql/`.
+`_checkout_race_probe.py`, `_owner_lock_race_probe.py`,
+`_orders_history_probe.py`, `_order_status_probe.py`,
+`_checkout_rollback_probe.py`, `_concurrency_http_probe.py`,
+`_m5_review_probe.py`, `_error_contract_probe.py`, `_regression_probe.py`
+(регрессия M1–M5 одним запуском, 31 проба), `_pg_admin.py`,
+`check_env.py`, `sql/`. Пробы НЕ попадают в репозиторий (`*_probe.py` в
+`.gitignore`): проверяющий, клонировавший репозиторий, их не получит.
 
 ## Путь запроса (архитектура M2)
 
@@ -376,9 +487,12 @@ Pydantic-модели (Decimal/int/str), а не ORM-объекты: `transactio
 
 ```
 HTTP-запрос
-  Depends(get_current_user)  -> сессия auth из Depends(get_session):
-                                 чтение User открыло транзакцию (autobegin)
-                                 -> begin() в ней ЗАПРЕЩЁН (InvalidRequestError)
+  Depends(get_current_user_id) -> (M6) КОРОТКАЯ сессия with SessionLocal():
+                                 проверка JWT, SELECT users по sub, -> user.id;
+                                 close() откатывает autobegin-транзакцию и
+                                 ВОЗВРАЩАЕТ соединение в пул до вызова сервиса
+                                 (до M6 здесь была сессия из get_session, и она
+                                 висела idle in transaction до конца запроса — D1)
   роутер -> shop.add_cart_item(user_id, data)   (только проверенный user.id)
     transaction():
       session = SessionLocal()          # НОВАЯ сессия, не auth
@@ -390,6 +504,17 @@ HTTP-запрос
       commit  (нормальный выход) | rollback (любое исключение)
       finally: session.close()          # соединение возвращается в пул
 ```
+
+**Пул: одно соединение на запрос (D1, исправлено в M6).** Пул — 5 + 10 = 15
+соединений, `pool_timeout=3 c`. Пока auth-сессия жила до конца запроса,
+каждый запрос корзины/заказа держал ДВА соединения: при 20 одновременных
+запросах 15 «первых» соединений висели `idle in transaction`, вторые не
+доставались, и после 3 c ожидания приходил 500 (`QueuePool limit of size 5
+overflow 10 reached`): эксперимент N=20 → `{200: 3, 500: 17}`. После
+исправления тот же эксперимент → `{200: 20}`, N=40 → `{200: 40}`. Предел
+остаётся: если больше 15 запросов одновременно дольше 3 c ждут блокировку,
+лишние всё ещё могут получить 500 по `pool_timeout` (дальше N=40 при
+блокировке 2,8 c не проверялось).
 
 **Autobegin и почему нельзя `begin()` в auth-сессии.** SQLAlchemy 2.0
 начинает транзакцию неявно при первом обращении к БД. Зависимость
@@ -444,8 +569,12 @@ docker compose up -d --wait                 # БД healthy
 . .\sneaker_shop_.venv\Scripts\Activate.ps1 # или полный путь к python.exe
 python -m alembic upgrade head              # применить миграции
 python -m app.seed                          # каталог (повторный запуск безопасен)
-python -m uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.final_main:app --port 8000   # финальная точка входа (M6)
+python -m app.promote_admin --email admin@example.com   # роль после POST /auth/register
 ```
+
+Полная инструкция для нового пользователя (новый venv, `.env` только если
+нет, `setup_jwt.py`, остановка без `-v`, типовые ошибки) — `README.md`.
 
 ## Как проверять
 
@@ -630,15 +759,20 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 * **SQL-логгер включается не через `uvicorn --log-level`**, а конфигом
   логирования: `--log-config _logging.json` (в нём `sqlalchemy.engine` =
   INFO). Только так видно реальные запросы и можно доказать отсутствие N+1.
-* **`httpx` в venv нет** (и PyPI из песочницы недоступен), поэтому
-  `fastapi.testclient.TestClient` не используется: HTTP-проверки идут
-  против реального `uvicorn` через `curl.exe`. Если понадобится
-  `TestClient`, `httpx` придётся доустановить вне песочницы.
+* **`TestClient` не используется**: HTTP-проверки идут против реального
+  `uvicorn` (`urllib`/`curl.exe`). `httpx 0.28.1` с M6 есть в
+  `requirements.txt` (транзитивная зависимость), но пробы на нём не
+  построены.
 * **Чтение через сессию закрывается `ROLLBACK`** в логе SQLAlchemy
   (`BEGIN (implicit)` … `ROLLBACK`): это нормально, изменений нет.
 * **`price` и `size` в JSON — строки** (`"7990.00"`, `"42.0"`): так
-  задумано, `json_encoders` в схемах переводит `Decimal` в строку без
-  потери точности. Проверять в тестах надо строку, а не число.
+  задумано, тип `DecimalStr` (`app/schemas/money.py`, с M6 вместо
+  устаревшего `json_encoders`) переводит `Decimal` в строку
+  `format(v, "f")` без потери точности. Он стоит ровно на тех полях, где
+  раньше действовал `json_encoders` (тот не распространялся на вложенные
+  модели): поэтому `ProductSizeRead.size` внутри `ProductRead` идёт
+  стандартной сериализацией Pydantic (`1E+2` осталось бы `"1E+2"`). Ответы
+  и OpenAPI до/после замены совпали. Проверять в тестах надо строку.
 * **PostgreSQL молча округляет `numeric(10,2)`**: `0.001` превратится в
   `0.00`, `10.999` — в `11.00`. Поэтому три знака после точки отклоняет
   сам `ProductWrite` (`_validate_price`), иначе клиент получил бы товар по
@@ -1061,23 +1195,26 @@ API; `--phase teardown` → `TEARDOWN OK`; `_catalog_acceptance.ps1` →
 
 ## Чего ещё нет
 
-* Checkout завершён: заказ, позиции-снимки, списание остатка и очистка
-  своей корзины — одна транзакция (части 2 и 3), транзакционный слой общий
-  для корзины и checkout (часть 4).
-* Не сделана только **смена статуса** заказа: `PATCH /orders/{id}/status`
-  под `require_admin` (`403` неадминистратору, `404` чужой/несуществующий,
-  `422` недопустимый статус). Это следующий шаг.
-* Маршрута чтения заказа (`GET /orders/{id}`) нет: история проверялась
-  прямым SQL.
+* (M6) Все модули M0–M5 сделаны: checkout одной транзакцией, история
+  (`GET /orders`, `GET /orders/{order_id}`) и смена статуса
+  (`PATCH /orders/{order_id}/status`, администратор) есть. Ранее здесь было
+  «смены статуса и чтения заказа нет» — устарело.
+* **Полной идемпотентности нет (D2, честное ограничение, не исправляется):**
+  нет `Idempotency-Key`; если ответ на `POST /orders` потерян после commit,
+  повтор вслепую может создать второй заказ (или дать неоднозначный 409
+  `Cart is empty`). Клиент сначала проверяет `GET /orders`. Записано в README.
+* Проект учебный, не production-ready: один процесс uvicorn, пул 15
+  соединений, нет rate limit, refresh-токенов, CI, деплоя.
 * Название товара в истории заказа не хранится: в `order_items` нет колонки
   `name` (только `product_size_id`, `quantity`, `price_at_purchase`).
   Если понадобится — отдельная миграция; в DTO заказа «текущее» имя не
   подставляется, чтобы не выдавать его за историю.
 * Запись каталога подключена и защищена; `require_admin` работает.
-* Публичного маршрута назначения администратора нет: роль меняется только
-  прямым UPDATE в БД (для приёмки админ создаётся так же).
+* Публичного маршрута назначения администратора нет намеренно: роль выдаёт
+  консольная команда `python -m app.promote_admin --email …` (M6) — прямой
+  UPDATE в БД из `DATABASE_URL`.
 * **Отложенное требование M2 закрыто** матрицей записи на результата M3
-  (часть 9). Осталось на будущие модули: статус заказа и его чтение.
+  (часть 9).
 * Swagger не умеет логиниться JSON-формой: `HTTPBearer` — это только поле
   для вставки токена. Порядок: вызвать `/auth/login`, затем Authorize.
 * Постоянное время ответа входа не гарантируется: dummy_hash выравнивает
@@ -1351,6 +1488,8 @@ query-параметром: иначе клиент сможет ломать ch
     `session.begin()` даёт `InvalidRequestError`. Бизнес-операции открывают
     СВОЮ `SessionLocal()` (`shop.transaction()`), а не переиспользуют
     auth-сессию и не коммитят её. Проверено в `_transaction_probe.py`.
+    С M6 auth-сессия для корзины и заказов ещё и закрывается до вызова
+    сервиса (правило 30).
 26. **Проверки по исходникам — только по коду, не по тексту.** После
     появления докстринга про `UPDATE product_sizes` наивная проверка
     «в сервисе нет UPDATE stock» упала; теперь `code_only()` в
@@ -1373,3 +1512,35 @@ query-параметром: иначе клиент сможет ломать ch
     цикл сразу после обнаружения ожидания сервиса — тогда жертвой
     гарантированно станет транзакция сервиса (его `deadlock_timeout` 1 с
     меньше), и проба увидит 40P01 → 409 `concurrent_change_retry`.
+30. **Зависимость авторизации не должна держать соединение, если дальше
+    сервис открывает своё** (D1, M6). `Depends(get_session)` живёт до конца
+    запроса, и сессия после чтения `User` висит `idle in transaction`:
+    запрос держит два соединения, и под нагрузкой пул (15) кончается раньше,
+    чем запросы, — 500 по `pool_timeout`. Для маршрутов, где работает
+    `shop.transaction()`, пользователь читается в `with SessionLocal()` и
+    наружу уходит только `int` (`get_current_user_id`,
+    `get_current_admin_id`). Где маршрут сам работает той же сессией
+    (`/auth/me`, запись каталога), второго соединения нет, и
+    `get_current_user`/`require_admin` остаются. Доказывать —
+    `pg_stat_activity` (сколько `idle in transaction`) и кодами ответов
+    при N одновременных запросах, а не чтением кода.
+31. **Проба, которая работает в БД из `DATABASE_URL`, не должна попадать
+    на рабочую.** `_filters_empty_db_probe.py` делает `TRUNCATE … ROLLBACK`
+    в БД из `DATABASE_URL`: данные откатываются, но таблицы на время
+    транзакции целиком заблокированы (`ACCESS EXCLUSIVE`), и приложение
+    ученика ждёт. В регрессии она идёт на временной БД (часть 2). И не
+    зашивать в проверки имя рабочей БД: проверять «моя временная БД
+    удалена», а не «осталась ровно `sneaker_shop`».
+32. **Кириллица в `requirements*.txt` ломает pip на Windows** (читает cp1251:
+    `UnicodeDecodeError 0x98`). Либо первая строка
+    `# -*- coding: utf-8 -*-` (`requirements.txt`), либо комментарии только
+    ASCII (`requirements-m3.txt`).
+33. **Замену сериализации проверять снимком «до/после»**, а не регрессией:
+    пробы смотрят типичные цены (`"7990.00"`), а различие видно на краях
+    (`Decimal("1E+2")` → `"100"` против `"1E+2"`) и в OpenAPI (`pattern`).
+    Снимок JSON + python-типов + полной `app.openapi()` снимается ДО правки
+    кода. Docstring схем попадают в OpenAPI как `description`: их правка —
+    ожидаемое различие.
+34. **Чистый запуск проверять и из `git clone`, а не только из копии
+    рабочего дерева**: копия содержит незакоммиченные и игнорируемые файлы
+    (пробы, `.env`), а проверяющий получит только то, что в репозитории.

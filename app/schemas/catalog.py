@@ -20,6 +20,8 @@ from pydantic import (
     HttpUrl,
 )
 
+from app.schemas.money import DecimalStr
+
 # brand_id ссылается на brands.id: Integer в PostgreSQL = 32 бита,
 # поэтому больше 2147483647 база всё равно не примет.
 BrandId = Annotated[int, Field(gt=0, le=2147483647)]
@@ -72,7 +74,7 @@ def _validate_description(value: Any) -> Any:
 def _url_to_str(value: Any) -> Any:
     """HttpUrl -> str перед колонкой Text.
 
-    Нужно не для ответа (там json_encoders сам делает строку), а для записи:
+    Нужно не для ответа (там Pydantic сам делает строку), а для записи:
     psycopg не умеет адаптировать объект HttpUrl к типу text.
     """
     if isinstance(value, HttpUrl):
@@ -104,19 +106,16 @@ class ProductRead(BaseModel):
 
     price и size — Decimal: в Python это точные десятичные числа, а в JSON
     они уходят строками ("7990.00"), потому что JSON не различает int и
-    Decimal, а float для денег недопустим. Строку в JSON даёт
-    json_encoders ниже.
+    Decimal, а float для денег недопустим. Строку в JSON для price даёт тип
+    DecimalStr (app/schemas/money.py).
     """
 
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_encoders={Decimal: lambda value: format(value, "f")},
-    )
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     name: str
     brand_id: int
-    price: Decimal
+    price: DecimalStr
     description: str
     image_url: str | None
     sizes: list[ProductSizeRead]

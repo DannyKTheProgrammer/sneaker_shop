@@ -1,3 +1,6 @@
+# OUTDATED M3 snapshot, kept for history only. It is INCOMPLETE:
+# installing from it fails at startup (No module named 'pydantic_settings').
+# Use requirements.txt - the full pinned stack (see README.md).
 alembic==1.20.0
 annotated-doc==0.0.5
 annotated-types==0.8.0

@@ -24,11 +24,11 @@
 # всём проекте: float для денег не используется.
 
 from datetime import datetime
-from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.money import DecimalStr
 from app.schemas.query import Limit, Offset
 
 # Ровно те значения, что разрешает CHECK ck_order_status из миграции M1.
@@ -87,14 +87,10 @@ class OrderItemRead(BaseModel):
     отношения не имеет.
     """
 
-    model_config = ConfigDict(
-        json_encoders={Decimal: lambda value: format(value, "f")},
-    )
-
     product_size_id: int
     quantity: int
-    price_at_purchase: Decimal
-    subtotal: Decimal
+    price_at_purchase: DecimalStr
+    subtotal: DecimalStr
 
 
 class OrderRead(BaseModel):
@@ -108,12 +104,8 @@ class OrderRead(BaseModel):
     создания, а не время клиента.
     """
 
-    model_config = ConfigDict(
-        json_encoders={Decimal: lambda value: format(value, "f")},
-    )
-
     id: int
     status: str
-    total: Decimal
+    total: DecimalStr
     created_at: datetime
     items: list[OrderItemRead]

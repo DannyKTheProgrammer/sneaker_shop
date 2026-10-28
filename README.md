@@ -156,12 +156,16 @@ python -m app.promote_admin --email admin@example.com
 
 ## Карта API
 
+19 пар «метод + путь» — столько же, сколько в `/openapi.json`: 18 маршрутов
+магазина и вспомогательный `GET /auth/admin-check`.
+
 | Маршрут | Доступ |
 |---|---|
 | `GET /health` | всем |
 | `GET /brands`, `GET /products`, `GET /products/{id}` | всем |
 | `POST /auth/register`, `POST /auth/login` | всем |
 | `GET /auth/me` | с токеном |
+| `GET /auth/admin-check` | администратор; вспомогательный маршрут проверки роли из M3, данных не меняет |
 | `POST /products`, `PUT /products/{id}`, `DELETE /products/{id}` | администратор |
 | `POST /cart/items`, `GET /cart`, `PATCH /cart/items/{item_id}`, `DELETE /cart/items/{item_id}` | с токеном, только своя корзина |
 | `POST /orders`, `GET /orders`, `GET /orders/{order_id}` | с токеном, только свои заказы |
