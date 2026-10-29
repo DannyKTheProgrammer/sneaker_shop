@@ -7,7 +7,7 @@
 #
 # .env ищется от расположения этого файла, а не от текущей рабочей папки:
 #   app/core/config.py -> parents[2] == корень проекта,
-# поэтому `python -m uvicorn app.main:app` работает и из корня, и из другого cwd.
+# поэтому `python -m uvicorn app.final_main:app` работает и из корня, и из другого cwd.
 
 from pathlib import Path
 

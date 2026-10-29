@@ -8,19 +8,14 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, HTTPException, Query, status
 
-from app.database import get_session
+from app.dependencies import SessionDep
 from app.schemas.catalog import BrandRead, ProductRead
 from app.schemas.query import ProductFilters
 from app.services import catalog as catalog_service
 
 router = APIRouter(tags=["catalog"])
-
-# Сессия на один запрос: FastAPI откроет её перед обработчиком и закроет
-# после ответа (generate-зависимость из app.database.get_session).
-SessionDep = Annotated[Session, Depends(get_session)]
 
 
 @router.get("/brands", summary="Список брендов")

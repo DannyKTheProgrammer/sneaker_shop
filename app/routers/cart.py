@@ -9,15 +9,15 @@
 # (extra="forbid" в CartItemAdd отклонит такую попытку 422), ни в
 # query-параметрах поля user_id нет вовсе.
 #
-# Роутер подключается только там, где разрешена запись (app/store_main.py
-# и app/main.py). Контрольная точка M2 (app/catalog_main.py) его не
+# Роутер подключается только сборкой build_app(include_writes=True)
+# (app/final_main.py). Сборка M2 (include_writes=False) его не
 # подключает, поэтому корзины в её OpenAPI нет вообще — там 404, а не 405.
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Response, status
 
-from app.routers.auth import get_current_user_id
+from app.dependencies import get_current_user_id
 from app.schemas.cart import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
 from app.services import shop as shop_service
 

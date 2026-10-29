@@ -1,0 +1,38 @@
+=== часть 1: самодостаточные пробы ===
+_seed_probe.py                     rc=0 ok=31   fail=0     1.4s :: INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц м
+_product_write_probe.py            rc=0 ok=47   fail=0     1.0s :: ALL CHECKS PASSED
+_write_service_probe.py            rc=0 ok=45   fail=0     2.5s :: INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц м
+_delete_service_probe.py           rc=0 ok=33   fail=0     2.5s :: INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц м
+_cart_service_probe.py             rc=0 ok=46   fail=0     3.8s :: INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц м
+_cart_get_service_probe.py         rc=0 ok=45   fail=0     2.2s :: INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц м
+_cart_duplicate_probe.py           rc=0 ok=31   fail=0     4.5s :: ALL DUPLICATE-ADD CHECKS PASSED
+_cart_isolation_probe.py           rc=0 ok=58   fail=0     7.6s :: ALL CART ISOLATION CHECKS PASSED
+_cart_patch_delete_probe.py        rc=0 ok=44   fail=0     6.5s :: ALL CART PATCH/DELETE CHECKS PASSED
+_m4_review_probe.py                rc=0 ok=155  fail=0     7.4s :: ALL M4 REVIEW CHECKS PASSED
+_orders_checkout_probe.py          rc=0 ok=56   fail=0     6.9s :: ALL ORDER CHECKOUT CHECKS PASSED
+_transaction_probe.py              rc=0 ok=38   fail=0    19.4s :: ALL TRANSACTION CHECKS PASSED
+_checkout_race_probe.py            rc=0 ok=45   fail=0     6.2s :: ShopError ConcurrentChangeConflict -> 409: concurrent_change_retry
+_owner_lock_race_probe.py          rc=0 ok=47   fail=0     4.6s :: ShopError CartItemNotFound -> 404: Cart item not found
+_orders_history_probe.py           rc=0 ok=72   fail=0     5.7s :: ShopError OrderNotFound -> 404: Order not found
+_order_status_probe.py             rc=0 ok=82   fail=0     5.2s :: ShopError OrderStatusConflict -> 409: Order status transition completed -> created is not 
+_checkout_rollback_probe.py        rc=0 ok=67   fail=0     8.1s :: ALL CHECKOUT ROLLBACK CHECKS PASSED
+_concurrency_http_probe.py         rc=0 ok=63   fail=0     8.5s :: ALL HTTP CONCURRENCY CHECKS PASSED
+_m5_review_probe.py                rc=0 ok=31   fail=0     5.0s :: ShopError CartEmptyConflict -> 409: Cart is empty
+_cart_items_acceptance.ps1         rc=0 ok=53   fail=0     7.7s :: ALL CART HTTP CHECKS PASSED
+_cart_get_acceptance.ps1           rc=0 ok=52   fail=0     8.6s :: ALL CART GET HTTP CHECKS PASSED
+
+=== часть 2: каталог и вход на временной БД sneaker_regr_kug4ii ===
+_catalog_filters_probe.py          rc=0 ok=67   fail=0     0.5s :: ALL CHECKS PASSED
+_m2_contract_review.py             rc=0 ok=87   fail=0     1.5s :: ALL CHECKS PASSED
+_auth_register_probe.py            rc=0 ok=66   fail=0     3.2s :: ALL CHECKS PASSED
+_auth_login_probe.py               rc=0 ok=51   fail=0     9.4s :: ALL CHECKS PASSED
+_jwt_probe.py                      rc=0 ok=47   fail=0     3.6s :: ALL CHECKS PASSED
+_auth_guard_probe.py               rc=0 ok=90   fail=0     1.9s :: ALL CHECKS PASSED
+_write_matrix_probe.py             rc=0 ok=92   fail=0     2.1s :: ALL CHECKS PASSED
+_m3_review_probe.py                rc=0 ok=155  fail=0     3.0s :: ALL CHECKS PASSED
+_m2_checkpoint_probe.py            rc=0 ok=10   fail=0     0.8s :: ALL CHECKS PASSED
+_filters_empty_db_probe.py         rc=0 ok=22   fail=0     0.7s :: ALL CHECKS PASSED
+
+проб: 31, с ошибками: 0; рабочая БД не изменилась: True; лишние БД: []
+REGRESSION PASSED
+exit=0

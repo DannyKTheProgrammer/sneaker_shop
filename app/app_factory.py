@@ -4,8 +4,9 @@
 # одним — подключён ли роутер записи. Дублировать health, роутеры и
 # обработчик ошибок в двух модулях значило бы гарантированно их разъехать.
 #
-#   build_app(include_writes=True)  → app/store_main.py  (M3: чтение + запись)
-#   build_app(include_writes=False) → app/catalog_main.py (M2: только чтение)
+#   build_app(include_writes=True)  → app/final_main.py (полный состав M3–M5)
+#   build_app(include_writes=False) → сборка M2 «только чтение»; отдельной
+#                                     точки запуска нет, её поднимают пробы
 
 import logging
 from collections.abc import AsyncIterator

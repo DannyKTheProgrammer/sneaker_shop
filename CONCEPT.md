@@ -135,7 +135,7 @@ products.price — текущая цена, её может поменять а�
 
 Клиент не присылает ни одно из этих значений. Тело запроса пустое или {}. OrderCreate с extra="forbid" отвечает 422 на любое лишнее поле, например user_id или total.
 
-Пользователь. get_current_user_id (routers/auth.py) проверяет JWT и по его sub читает строку users. В сервис передаётся только user_id.
+Пользователь. get_current_user_id (app/dependencies.py) проверяет JWT и по его sub читает строку users. В сервис передаётся только user_id.
 Корзина. Сервис читает cart_items WHERE user_id = user_id.
 Цена. Берётся из products.price после блокировки этих строк.
 Сумма. Сервис считает её сам как Decimal по ценам из БД. Затем проверяет, что она не больше предела Numeric(12,2).
@@ -207,7 +207,7 @@ JWT не хранится в базе, только на клиенте - это
 
 ##   Что токен подтверждает и как сервер получает текущего User?
 
-Цепочка _user_from_token (routers/auth.py:51):
+Метод _user_from_token (app/dependencies.py) получает юзера по токену.
 
 BearerCredentials = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] достаёт токен из заголовка. Нет заголовка → 401 Not authenticated.
 

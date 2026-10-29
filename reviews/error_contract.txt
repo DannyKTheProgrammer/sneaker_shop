@@ -1,0 +1,294 @@
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 422, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 63, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\applications.py", line 1163, in __call__
+    await super().__call__(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\applications.py", line 96, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
+    raise exc
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\middleware\asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\routing.py", line 676, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 2734, in app
+    await route.handle(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 1780, in handle
+    await self.original_router.handle(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 2789, in handle
+    await included_router._handle_selected(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 1800, in _handle_selected
+    await original_route.handle(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 1279, in handle
+    await app(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 158, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 144, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 706, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\fastapi\routing.py", line 354, in run_endpoint_function
+    return await run_in_threadpool(dependant.call, **values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\starlette\concurrency.py", line 34, in run_in_threadpool
+    return await anyio.to_thread.run_sync(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\anyio\to_thread.py", line 65, in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2706, in run_sync_in_worker_thread
+    return await future
+           ^^^^^^^^^^^^
+  File "W:\sneaker_shop\sneaker_shop_.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 1100, in run
+    result = context.run(func, *args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\app\routers\order.py", line 172, in create_order
+    return shop_service.create_order(user_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\app\services\shop.py", line 746, in create_order
+    order_id, status, total, created_at, items = _create_order(session, user_id)
+                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "W:\sneaker_shop\app\services\shop.py", line 860, in _create_order
+    _fault("after_first_stock")
+  File "W:\sneaker_shop\app\services\shop.py", line 698, in _fault
+    hook(stage)
+  File "W:\sneaker_shop\_error_contract_probe.py", line 382, in boom
+    raise RuntimeError(f"probe internal failure {SECRET}")
+RuntimeError: probe internal failure Sup3r-Secret-rxsr3l
+
+=== 0. временная БД, сервер ===
+  временная БД: sneaker_err_rxsr3l
+  [OK] alembic upgrade head :: INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц магазина (M1)
+  [OK] seed :: INFO __main__: Seed выполнен: 2 бренда, 3 товара, 4 размера; существующие строки не изменялись
+  [OK] сервер поднят
+  фикстуры: заказ Бориса 1, позиция Бориса 2, в корзине Ани 101 x1
+
+=== 401 — нет входа или токен не принят ===
+  401 GET /auth/me                             -> 401 {"detail":"Not authenticated"}
+  [OK] 401 GET /auth/me: код 401 :: код 401
+  [OK] 401 GET /auth/me: форма detail (строка) = 'Not authenticated'
+  [OK] 401 GET /auth/me: нет SQL/traceback/секретов в ответе :: []
+  [OK] 401 GET /auth/me: БД без изменений (7 таблиц)
+  [OK] 401 GET /auth/me: заголовок WWW-Authenticate: Bearer :: Bearer
+  401 POST /cart/items                         -> 401 {"detail":"Not authenticated"}
+  [OK] 401 POST /cart/items: код 401 :: код 401
+  [OK] 401 POST /cart/items: форма detail (строка) = 'Not authenticated'
+  [OK] 401 POST /cart/items: нет SQL/traceback/секретов в ответе :: []
+  [OK] 401 POST /cart/items: БД без изменений (7 таблиц)
+  [OK] 401 POST /cart/items: заголовок WWW-Authenticate: Bearer :: Bearer
+  401 POST /orders                             -> 401 {"detail":"Could not validate credentials"}
+  [OK] 401 POST /orders: код 401 :: код 401
+  [OK] 401 POST /orders: форма detail (строка) = 'Could not validate credentials'
+  [OK] 401 POST /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 401 POST /orders: БД без изменений (7 таблиц)
+  [OK] 401 POST /orders: заголовок WWW-Authenticate: Bearer :: Bearer
+  401 GET /orders                              -> 401 {"detail":"Could not validate credentials"}
+  [OK] 401 GET /orders: код 401 :: код 401
+  [OK] 401 GET /orders: форма detail (строка) = 'Could not validate credentials'
+  [OK] 401 GET /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 401 GET /orders: БД без изменений (7 таблиц)
+  [OK] 401 GET /orders: заголовок WWW-Authenticate: Bearer :: Bearer
+  401 PATCH /orders/1/status                   -> 401 {"detail":"Not authenticated"}
+  [OK] 401 PATCH /orders/1/status: код 401 :: код 401
+  [OK] 401 PATCH /orders/1/status: форма detail (строка) = 'Not authenticated'
+  [OK] 401 PATCH /orders/1/status: нет SQL/traceback/секретов в ответе :: []
+  [OK] 401 PATCH /orders/1/status: БД без изменений (7 таблиц)
+  [OK] 401 PATCH /orders/1/status: заголовок WWW-Authenticate: Bearer :: Bearer
+  401 POST /auth/login                         -> 401 {"detail":"Invalid email or password"}
+  [OK] 401 POST /auth/login: код 401 :: код 401
+  [OK] 401 POST /auth/login: форма detail (строка)
+  [OK] 401 POST /auth/login: нет SQL/traceback/секретов в ответе :: []
+  [OK] 401 POST /auth/login: БД без изменений (7 таблиц)
+  [OK] 401 POST /auth/login: заголовок WWW-Authenticate: Bearer :: Bearer
+
+=== 403 — вход есть, роли нет ===
+  403 POST /products                           -> 403 {"detail":"Administrator privileges required"}
+  [OK] 403 POST /products: код 403 :: код 403
+  [OK] 403 POST /products: форма detail (строка) = 'Administrator privileges required'
+  [OK] 403 POST /products: нет SQL/traceback/секретов в ответе :: []
+  [OK] 403 POST /products: БД без изменений (7 таблиц)
+  403 PATCH /orders/1/status                   -> 403 {"detail":"Administrator privileges required"}
+  [OK] 403 PATCH /orders/1/status: код 403 :: код 403
+  [OK] 403 PATCH /orders/1/status: форма detail (строка) = 'Administrator privileges required'
+  [OK] 403 PATCH /orders/1/status: нет SQL/traceback/секретов в ответе :: []
+  [OK] 403 PATCH /orders/1/status: БД без изменений (7 таблиц)
+
+=== 404 — чужой или неизвестный объект (тела одинаковы) ===
+  404 GET /orders/1                            -> 404 {"detail":"Order not found"}
+  [OK] 404 GET /orders/1: код 404 :: код 404
+  [OK] 404 GET /orders/1: форма detail (строка) = 'Order not found'
+  [OK] 404 GET /orders/1: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 GET /orders/1: БД без изменений (7 таблиц)
+  404 GET /orders/999999                       -> 404 {"detail":"Order not found"}
+  [OK] 404 GET /orders/999999: код 404 :: код 404
+  [OK] 404 GET /orders/999999: форма detail (строка) = 'Order not found'
+  [OK] 404 GET /orders/999999: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 GET /orders/999999: БД без изменений (7 таблиц)
+  [OK] 404 чужого и неизвестного заказа неотличимы
+  404 GET /orders/1                            -> 404 {"detail":"Order not found"}
+  [OK] 404 GET /orders/1: код 404 :: код 404
+  [OK] 404 GET /orders/1: форма detail (строка) = 'Order not found'
+  [OK] 404 GET /orders/1: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 GET /orders/1: БД без изменений (7 таблиц)
+  404 PATCH /cart/items/2                      -> 404 {"detail":"Cart item not found"}
+  [OK] 404 PATCH /cart/items/2: код 404 :: код 404
+  [OK] 404 PATCH /cart/items/2: форма detail (строка) = 'Cart item not found'
+  [OK] 404 PATCH /cart/items/2: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 PATCH /cart/items/2: БД без изменений (7 таблиц)
+  404 DELETE /cart/items/2                     -> 404 {"detail":"Cart item not found"}
+  [OK] 404 DELETE /cart/items/2: код 404 :: код 404
+  [OK] 404 DELETE /cart/items/2: форма detail (строка) = 'Cart item not found'
+  [OK] 404 DELETE /cart/items/2: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 DELETE /cart/items/2: БД без изменений (7 таблиц)
+  404 POST /cart/items                         -> 404 {"detail":"Product size not found"}
+  [OK] 404 POST /cart/items: код 404 :: код 404
+  [OK] 404 POST /cart/items: форма detail (строка) = 'Product size not found'
+  [OK] 404 POST /cart/items: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 POST /cart/items: БД без изменений (7 таблиц)
+  404 PATCH /orders/999999/status              -> 404 {"detail":"Order not found"}
+  [OK] 404 PATCH /orders/999999/status: код 404 :: код 404
+  [OK] 404 PATCH /orders/999999/status: форма detail (строка) = 'Order not found'
+  [OK] 404 PATCH /orders/999999/status: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 PATCH /orders/999999/status: БД без изменений (7 таблиц)
+  404 GET /products/999999                     -> 404 {"detail":"Product not found"}
+  [OK] 404 GET /products/999999: код 404 :: код 404
+  [OK] 404 GET /products/999999: форма detail (строка)
+  [OK] 404 GET /products/999999: нет SQL/traceback/секретов в ответе :: []
+  [OK] 404 GET /products/999999: БД без изменений (7 таблиц)
+
+=== 409 — форма верна, состояние данных не позволяет ===
+  409 POST /cart/items                         -> 409 {"detail":"Only 3 item(s) of this size are in stock"}
+  [OK] 409 POST /cart/items: код 409 :: код 409
+  [OK] 409 POST /cart/items: форма detail (строка) = 'Only 3 item(s) of this size are in stock'
+  [OK] 409 POST /cart/items: нет SQL/traceback/секретов в ответе :: []
+  [OK] 409 POST /cart/items: БД без изменений (7 таблиц)
+  409 PATCH /orders/1/status                   -> 409 {"detail":"Order status transition created -> completed is not allowed"}
+  [OK] 409 PATCH /orders/1/status: код 409 :: код 409
+  [OK] 409 PATCH /orders/1/status: форма detail (строка) = 'Order status transition created -> completed is not allowed'
+  [OK] 409 PATCH /orders/1/status: нет SQL/traceback/секретов в ответе :: []
+  [OK] 409 PATCH /orders/1/status: БД без изменений (7 таблиц)
+  409 POST /auth/register                      -> 409 {"detail":"Email already registered"}
+  [OK] 409 POST /auth/register: код 409 :: код 409
+  [OK] 409 POST /auth/register: форма detail (строка)
+  [OK] 409 POST /auth/register: нет SQL/traceback/секретов в ответе :: []
+  [OK] 409 POST /auth/register: БД без изменений (7 таблиц)
+  409 POST /orders                             -> 409 {"detail":"Cart is empty"}
+  [OK] 409 POST /orders: код 409 :: код 409
+  [OK] 409 POST /orders: форма detail (строка) = 'Cart is empty'
+  [OK] 409 POST /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 409 POST /orders: БД без изменений (7 таблиц)
+  409 POST /orders                             -> 409 {"detail":"Not enough stock for product size 201: requested 1, available 0"}
+  [OK] 409 POST /orders: код 409 :: код 409
+  [OK] 409 POST /orders: форма detail (строка) = 'Not enough stock for product size 201: requested 1, available 0'
+  [OK] 409 POST /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 409 POST /orders: БД без изменений (7 таблиц)
+  события в процессе сервера: ['rollback', 'handler:OrderStockConflict']
+  [OK] checkout: ROLLBACK транзакции сервиса раньше, чем HTTP-обработчик ошибки :: ['rollback', 'handler:OrderStockConflict']
+  409 POST /orders                             -> 409 {"detail":"concurrent_change_retry"}
+  [OK] 409 POST /orders: код 409 :: код 409
+  [OK] 409 POST /orders: форма detail (строка) = 'concurrent_change_retry'
+  [OK] 409 POST /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 409 POST /orders: БД без изменений (7 таблиц)
+  [OK] lock_timeout: rollback раньше обработчика :: ['rollback', 'handler:ConcurrentChangeConflict']
+
+=== 422 — неверная форма; значения запроса не возвращаются ===
+  422 POST /auth/register                      -> 422 {"detail":[{"type":"value_error","loc":["body","email"],"msg":"value is not a valid email address: An email ad
+  [OK] 422 POST /auth/register: код 422 :: код 422
+  [OK] 422 POST /auth/register: форма detail (список type/loc/msg)
+  [OK] 422 POST /auth/register: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /auth/register: БД без изменений (7 таблиц)
+  422 POST /auth/register                      -> 422 {"detail":[{"type":"value_error","loc":["body","password"],"msg":"Value error, password must be at least 8 cha
+  [OK] 422 POST /auth/register: код 422 :: код 422
+  [OK] 422 POST /auth/register: форма detail (список type/loc/msg)
+  [OK] 422 POST /auth/register: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /auth/register: БД без изменений (7 таблиц)
+  422 POST /auth/login                         -> 422 {"detail":[{"type":"extra_forbidden","loc":["body","token"],"msg":"Extra inputs are not permitted"}]}
+  [OK] 422 POST /auth/login: код 422 :: код 422
+  [OK] 422 POST /auth/login: форма detail (список type/loc/msg)
+  [OK] 422 POST /auth/login: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /auth/login: БД без изменений (7 таблиц)
+  422 POST /cart/items                         -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] 422 POST /cart/items: код 422 :: код 422
+  [OK] 422 POST /cart/items: форма detail (список type/loc/msg)
+  [OK] 422 POST /cart/items: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /cart/items: БД без изменений (7 таблиц)
+  422 POST /cart/items                         -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","quantity"],"msg":"Input should be greater than or equal
+  [OK] 422 POST /cart/items: код 422 :: код 422
+  [OK] 422 POST /cart/items: форма detail (список type/loc/msg)
+  [OK] 422 POST /cart/items: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /cart/items: БД без изменений (7 таблиц)
+  422 POST /orders                             -> 422 {"detail":[{"type":"extra_forbidden","loc":["body","_test_hook"],"msg":"Extra inputs are not permitted"}]}
+  [OK] 422 POST /orders: код 422 :: код 422
+  [OK] 422 POST /orders: форма detail (список type/loc/msg)
+  [OK] 422 POST /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /orders: БД без изменений (7 таблиц)
+  422 POST /orders                             -> 422 {"detail":[{"type":"json_invalid","loc":["body",0],"msg":"JSON decode error"}]}
+  [OK] 422 POST /orders: код 422 :: код 422
+  [OK] 422 POST /orders: форма detail (список type/loc/msg)
+  [OK] 422 POST /orders: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 POST /orders: БД без изменений (7 таблиц)
+  422 GET /orders?limit=0                      -> 422 {"detail":[{"type":"greater_than_equal","loc":["query","limit"],"msg":"Input should be greater than or equal t
+  [OK] 422 GET /orders?limit=0: код 422 :: код 422
+  [OK] 422 GET /orders?limit=0: форма detail (список type/loc/msg)
+  [OK] 422 GET /orders?limit=0: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 GET /orders?limit=0: БД без изменений (7 таблиц)
+  422 PATCH /orders/1/status                   -> 422 {"detail":[{"type":"literal_error","loc":["body","status"],"msg":"Input should be 'created', 'processing' or '
+  [OK] 422 PATCH /orders/1/status: код 422 :: код 422
+  [OK] 422 PATCH /orders/1/status: форма detail (список type/loc/msg)
+  [OK] 422 PATCH /orders/1/status: нет SQL/traceback/секретов в ответе :: []
+  [OK] 422 PATCH /orders/1/status: БД без изменений (7 таблиц)
+
+=== 500 — неожиданная ошибка не маскируется под 200/400/409 ===
+  500 POST /orders (внутренний сбой) -> 500 'Internal Server Error' content-type=text/plain; charset=utf-8
+  [OK] 500 Internal Server Error (не 200/400/409) :: код 500
+  [OK] тело 500 — общий текст, без traceback, SQL и текста исключения :: Internal Server Error
+  [OK] 500: БД без изменений (транзакция откатилась)
+  [OK] 500: rollback был, commit не было, обработчик ShopError не вызывался :: ['rollback']
+  [OK] разработчик видит traceback локально (лог сервера)
+
+=== 503 — /health при недоступной БД ===
+  [OK] /health на рабочей БД -> 200 {"status": "ok"} :: 200 {"status":"ok"}
+  503 GET /health (БД недоступна) -> 503 {"status":"unavailable"}
+  [OK] /health -> 503 :: код 503
+  [OK] тело 503 = {"status": "unavailable"} (свой контракт health, не detail) :: {"status":"unavailable"}
+  [OK] в теле 503 нет URL БД, логина, пароля, traceback
+  (для сравнения) GET /products на том же сервере -> 500 'Internal Server Error'
+  [OK] не-health маршрут при недоступной БД — 500 без деталей (503 обещан только /health) :: 500 Internal Server Error
+
+  временная БД удалена: sneaker_err_rxsr3l
+  [OK] лог сломанного сервера: причина 503 видна разработчику
+  [OK] рабочая БД не изменилась
+  [OK] в отчёте нет токенов, пароля и секрета
+
+=== сводка по кодам ===
+  401: 6 маршрут(ов)
+  403: 2 маршрут(ов)
+  404: 8 маршрут(ов)
+  409: 6 маршрут(ов)
+  422: 9 маршрут(ов)
+  500: 1 маршрут(ов)
+  503: 1 маршрут(ов)
+
+ALL ERROR CONTRACT CHECKS PASSED
+exit=0

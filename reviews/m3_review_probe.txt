@@ -1,0 +1,235 @@
+
+=== 1. среда и фикстуры ===
+  [OK] пользователи и токены готовы :: plain_id=15 admin_id=16
+
+=== 2. регистрация: успех, повтор email, неверный пароль ===
+  [OK] регистрация -> 201 :: http=201
+  [OK] ответ — только id/email/is_admin :: {'id': 17, 'email': 'fresh@m3-review.example.com', 'is_admin': False}
+  [OK] в ответе нет hashed_password и пароля
+  [OK] повтор того же email (другой регистр/пробелы) -> 409 :: http=409 {'detail': 'Email already registered'}
+  [OK] в 409 нет хэша и пароля
+  [OK] неверный пароль -> 401 :: http=401
+  [OK] неизвестный email -> тот же 401 и то же тело :: {'detail': 'Invalid email or password'} vs {'detail': 'Invalid email or password'}
+  [OK] 401 логина отдаёт WWW-Authenticate
+  [OK] регистрация: email без @ -> 422 :: http=422
+  [OK] пароль не вернулся в 422 (email без @) :: {"detail":[{"type":"value_error","loc":["body","email"],"msg":"value is not a valid email address: An email address must
+  [OK] в ошибке нет input/ctx (email без @) :: ['loc', 'msg', 'type']
+  [OK] регистрация: пароль 73 байта -> 422 :: http=422
+  [OK] пароль не вернулся в 422 (пароль 73 байта) :: {"detail":[{"type":"value_error","loc":["body","password"],"msg":"Value error, password must be at most 72 bytes in UTF-
+  [OK] в ошибке нет input/ctx (пароль 73 байта) :: ['loc', 'msg', 'type']
+  [OK] регистрация: лишнее is_admin -> 422 :: http=422
+  [OK] пароль не вернулся в 422 (лишнее is_admin) :: {"detail":[{"type":"extra_forbidden","loc":["body","is_admin"],"msg":"Extra inputs are not permitted"}]}
+  [OK] в ошибке нет input/ctx (лишнее is_admin) :: ['loc', 'msg', 'type']
+
+=== 3. матрица: 4 типа доступа × 3 метода записи ===
+  -- POST /products --
+  [OK] без токена -> 401 :: http=401 {'detail': 'Not authenticated'}
+  [OK] без токена: WWW-Authenticate: Bearer
+  [OK] без токена: данные ровно те же :: 17 -> 17
+  [OK] без токена: в теле нет хэша/секрета
+  [OK] неверный токен -> 401 :: http=401 {'detail': 'Could not validate credentials'}
+  [OK] неверный токен: WWW-Authenticate: Bearer
+  [OK] неверный токен: данные ровно те же :: 17 -> 17
+  [OK] неверный токен: в теле нет хэша/секрета
+  [OK] обычный пользователь -> 403 :: http=403 {'detail': 'Administrator privileges required'}
+  [OK] обычный пользователь: данные ровно те же :: 17 -> 17
+  [OK] обычный пользователь: в теле нет хэша/секрета
+  [OK] администратор -> 201 :: http=201 {'id': 32, 'name': 'Review Created', 'brand_id': 1, 'price': '4321.00'
+  [OK] 201 не изменил число строк неожиданно :: 17 -> 18
+  [OK] администратор: в теле нет хэша/секрета
+  -- PUT /products/9101 --
+  [OK] без токена -> 401 :: http=401 {'detail': 'Not authenticated'}
+  [OK] без токена: WWW-Authenticate: Bearer
+  [OK] без токена: данные ровно те же :: 18 -> 18
+  [OK] без токена: в теле нет хэша/секрета
+  [OK] неверный токен -> 401 :: http=401 {'detail': 'Could not validate credentials'}
+  [OK] неверный токен: WWW-Authenticate: Bearer
+  [OK] неверный токен: данные ровно те же :: 18 -> 18
+  [OK] неверный токен: в теле нет хэша/секрета
+  [OK] обычный пользователь -> 403 :: http=403 {'detail': 'Administrator privileges required'}
+  [OK] обычный пользователь: данные ровно те же :: 18 -> 18
+  [OK] обычный пользователь: в теле нет хэша/секрета
+  [OK] администратор -> 200 :: http=200 {'id': 9101, 'name': 'Review Renamed', 'brand_id': 1, 'price': '123.45
+  [OK] 200 не изменил число строк неожиданно :: 18 -> 18
+  [OK] администратор: в теле нет хэша/секрета
+  -- DELETE /products/9102 --
+  [OK] без токена -> 401 :: http=401 {'detail': 'Not authenticated'}
+  [OK] без токена: WWW-Authenticate: Bearer
+  [OK] без токена: данные ровно те же :: 18 -> 18
+  [OK] без токена: в теле нет хэша/секрета
+  [OK] неверный токен -> 401 :: http=401 {'detail': 'Could not validate credentials'}
+  [OK] неверный токен: WWW-Authenticate: Bearer
+  [OK] неверный токен: данные ровно те же :: 18 -> 18
+  [OK] неверный токен: в теле нет хэша/секрета
+  [OK] обычный пользователь -> 403 :: http=403 {'detail': 'Administrator privileges required'}
+  [OK] обычный пользователь: данные ровно те же :: 18 -> 18
+  [OK] обычный пользователь: в теле нет хэша/секрета
+  [OK] администратор -> 204 :: http=204 
+  [OK] DELETE 204: тело пустое :: ''
+  [OK] DELETE 204: ушли товар и его размер :: 18 -> 16
+  [OK] администратор: в теле нет хэша/секрета
+
+=== 4. невалидные JWT (все через HTTP) ===
+  [OK] подпись другим ключом -> 401 :: http=401
+  [OK] подпись другим ключом: WWW-Authenticate
+  [OK] подпись другим ключом: данные не изменились
+  [OK] подпись другим ключом: секрет не утёк
+  [OK] alg=none без подписи -> 401 :: http=401
+  [OK] alg=none без подписи: WWW-Authenticate
+  [OK] alg=none без подписи: данные не изменились
+  [OK] alg=none без подписи: секрет не утёк
+  [OK] HS512 тем же ключом -> 401 :: http=401
+  [OK] HS512 тем же ключом: WWW-Authenticate
+  [OK] HS512 тем же ключом: данные не изменились
+  [OK] HS512 тем же ключом: секрет не утёк
+  [OK] просроченный exp -> 401 :: http=401
+  [OK] просроченный exp: WWW-Authenticate
+  [OK] просроченный exp: данные не изменились
+  [OK] просроченный exp: секрет не утёк
+  [OK] без exp -> 401 :: http=401
+  [OK] без exp: WWW-Authenticate
+  [OK] без exp: данные не изменились
+  [OK] без exp: секрет не утёк
+  [OK] без sub -> 401 :: http=401
+  [OK] без sub: WWW-Authenticate
+  [OK] без sub: данные не изменились
+  [OK] без sub: секрет не утёк
+  [OK] без iss -> 401 :: http=401
+  [OK] без iss: WWW-Authenticate
+  [OK] без iss: данные не изменились
+  [OK] без iss: секрет не утёк
+  [OK] без aud -> 401 :: http=401
+  [OK] без aud: WWW-Authenticate
+  [OK] без aud: данные не изменились
+  [OK] без aud: секрет не утёк
+  [OK] чужой iss -> 401 :: http=401
+  [OK] чужой iss: WWW-Authenticate
+  [OK] чужой iss: данные не изменились
+  [OK] чужой iss: секрет не утёк
+  [OK] чужой aud -> 401 :: http=401
+  [OK] чужой aud: WWW-Authenticate
+  [OK] чужой aud: данные не изменились
+  [OK] чужой aud: секрет не утёк
+  [OK] sub не число -> 401 :: http=401
+  [OK] sub не число: WWW-Authenticate
+  [OK] sub не число: данные не изменились
+  [OK] sub не число: секрет не утёк
+  [OK] sub Unicode-цифры -> 401 :: http=401
+  [OK] sub Unicode-цифры: WWW-Authenticate
+  [OK] sub Unicode-цифры: данные не изменились
+  [OK] sub Unicode-цифры: секрет не утёк
+  [OK] sub больше int4 -> 401 :: http=401
+  [OK] sub больше int4: WWW-Authenticate
+  [OK] sub больше int4: данные не изменились
+  [OK] sub больше int4: секрет не утёк
+  [OK] sub отрицательный -> 401 :: http=401
+  [OK] sub отрицательный: WWW-Authenticate
+  [OK] sub отрицательный: данные не изменились
+  [OK] sub отрицательный: секрет не утёк
+  [OK] sub числом, не строкой -> 401 :: http=401
+  [OK] sub числом, не строкой: WWW-Authenticate
+  [OK] sub числом, не строкой: данные не изменились
+  [OK] sub числом, не строкой: секрет не утёк
+  [OK] несуществующий пользователь -> 401 :: http=401
+  [OK] несуществующий пользователь: WWW-Authenticate
+  [OK] несуществующий пользователь: данные не изменились
+  [OK] несуществующий пользователь: секрет не утёк
+
+=== 5. локальное повышение и отзыв роли (тот же токен) ===
+  [OK] до повышения: обычный пользователь -> 403 :: http=403
+  [OK] после повышения тот же токен -> 200 и роль из БД :: http=200 {'id': 15, 'email': 'plain@m3-review.example.com', 'is_admin': True}
+  [OK] после отзыва роли тот же токен -> 403 :: http=403
+
+=== 6. роль из запроса не принимается ===
+  [OK] claims is_admin=true не даёт доступ -> 403 :: http=403
+  [OK] тело is_admin=true не даёт доступ -> 403 :: http=403
+  [OK] query is_admin=true не даёт доступ -> 403 :: http=403
+  [OK] мусор после токена в заголовке -> 401 :: http=401
+
+=== 7. чтения остаются публичными ===
+  [OK] GET /health без токена -> 200 :: http=200
+  [OK] GET /health: данные не изменились
+  [OK] GET /brands без токена -> 200 :: http=200
+  [OK] GET /brands: данные не изменились
+  [OK] GET /products без токена -> 200 :: http=200
+  [OK] GET /products: данные не изменились
+  [OK] GET /products/10 без токена -> 200 :: http=200
+  [OK] GET /products/10: данные не изменились
+  [OK] GET /openapi.json без токена -> 200 :: http=200
+  [OK] GET /openapi.json: данные не изменились
+  [OK] GET /docs без токена -> 200 :: http=200
+  [OK] GET /docs: данные не изменились
+  [OK] в публичном списке нет hashed_password
+
+=== 8. Swagger: HTTPBearer и JSON-логин ===
+  [OK] в схемах только HTTPBearer (нет OAuth2 password flow) :: {'HTTPBearer': {'type': 'http', 'description': 'Вставьте access_token из /auth/login', 'scheme': 'bearer'}}
+  [OK] POST /products требует HTTPBearer :: [{'HTTPBearer': []}]
+  [OK] PUT /products/{product_id} требует HTTPBearer :: [{'HTTPBearer': []}]
+  [OK] DELETE /products/{product_id} требует HTTPBearer :: [{'HTTPBearer': []}]
+  [OK] логин принимает application/json (не form-urlencoded) :: ['application/json']
+
+=== 9. итоговое состояние ===
+  [OK] товар 9101 хранит результат PUT и не удалён :: Review Renamed
+  [OK] товар 9102 удалён успешным DELETE
+  [OK] история заказа и корзина не тронуты отказами :: orders=1 cart=1
+  [OK] пользователи фикстур на месте (повышение/отзыв не создали новых) :: users=3
+
+=== 10. уборка фикстур ===
+  [OK] пользователей прогона не осталось :: left=0
+
+=== 11. журнал фактически выполненных HTTP-запросов ===
+    всего запросов: 51
+      POST   /auth/login                  auth=нет                    -> 200
+      POST   /auth/login                  auth=нет                    -> 200
+      POST   /auth/register               auth=нет                    -> 201
+      POST   /auth/register               auth=нет                    -> 409
+      POST   /auth/login                  auth=нет                    -> 401
+      POST   /auth/login                  auth=нет                    -> 401
+      POST   /auth/register               auth=нет                    -> 422
+      POST   /auth/register               auth=нет                    -> 422
+      POST   /auth/register               auth=нет                    -> 422
+      POST   /products                    auth=нет                    -> 401
+      POST   /products                    auth=Bearer <token>         -> 401
+      POST   /products                    auth=Bearer <token>         -> 403
+      POST   /products                    auth=Bearer <token>         -> 201
+      PUT    /products/9101               auth=нет                    -> 401
+      PUT    /products/9101               auth=Bearer <token>         -> 401
+      PUT    /products/9101               auth=Bearer <token>         -> 403
+      PUT    /products/9101               auth=Bearer <token>         -> 200
+      DELETE /products/9102               auth=нет                    -> 401
+      DELETE /products/9102               auth=Bearer <token>         -> 401
+      DELETE /products/9102               auth=Bearer <token>         -> 403
+      DELETE /products/9102               auth=Bearer <token>         -> 204
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 401
+      GET    /auth/admin-check            auth=Bearer <token>         -> 403
+      GET    /auth/admin-check            auth=Bearer <token>         -> 200
+      GET    /auth/admin-check            auth=Bearer <token>         -> 403
+      GET    /auth/admin-check            auth=Bearer <token>         -> 403
+      GET    /auth/admin-check            auth=Bearer <token>         -> 403
+      GET    /auth/admin-check?is_admin=true auth=Bearer <token>         -> 403
+      GET    /auth/admin-check            auth=Authorization: Bearer ... -> 401
+      GET    /health                      auth=нет                    -> 200
+      GET    /brands                      auth=нет                    -> 200
+      GET    /products                    auth=нет                    -> 200
+      GET    /products/10                 auth=нет                    -> 200
+      GET    /openapi.json                auth=нет                    -> 200
+      GET    /docs                        auth=нет                    -> 200
+      GET    /products                    auth=нет                    -> 200
+
+ALL CHECKS PASSED
+

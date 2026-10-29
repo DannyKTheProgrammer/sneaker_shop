@@ -1,0 +1,54 @@
+
+=== 0. временная БД и сервер ===
+  временная БД: sneaker_m5rev_18ixrb
+  [OK] alembic upgrade head :: INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц магазина (M1)
+  [OK] seed :: INFO __main__: Seed выполнен: 2 бренда, 3 товара, 4 размера; существующие строки не изменялись
+  [OK] сервер поднят
+  [OK] Аня: регистрация 201 :: код 201
+  [OK] Борис: регистрация 201 :: код 201
+
+=== A. отказ по ВТОРОЙ позиции: 101 x2 хватает, 201 x1 — stock 0 ===
+  [OK] Аня: POST /cart/items 101 x2 -> 200 :: код 200 {"id":1,"product_size_id":101,"product_id":10,"name":"North Runner","size":"42.0","price":"7990.00",
+  [OK] Аня: POST /cart/items 201 x1 -> 200 :: код 200 {"id":2,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","qu
+  POST /orders -> 409 {"detail":"Not enough stock for product size 201: requested 1, available 0"}
+  [OK] 409 именно по второй позиции (размер 201), не по первой :: {"detail":"Not enough stock for product size 201: requested 1, available 0"}
+  [OK] A: products не изменилась (все строки, все колонки)
+  [OK] A: product_sizes не изменилась (все строки, все колонки)
+  [OK] A: cart_items не изменилась (все строки, все колонки)
+  [OK] A: orders не изменилась (все строки, все колонки)
+  [OK] A: order_items не изменилась (все строки, все колонки)
+  [OK] A: stock101 остался 3 — первая позиция не списана
+  [OK] A: ни одного INSERT/UPDATE/DELETE — проверка всех позиций до записей :: []
+
+=== B. порядок корзины 201, 101 -> блокировки и списание по возрастанию id ===
+  [OK] Борис: POST /cart/items 201 x1 -> 200 :: код 200 {"id":3,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","qu
+  [OK] Борис: POST /cart/items 101 x2 -> 200 :: код 200 {"id":4,"product_size_id":101,"product_id":10,"name":"North Runner","size":"42.0","price":"7990.00",
+  [OK] B: в корзине Бориса порядок строк 201, затем 101 :: [201, 101]
+  POST /orders -> 201 total=21970.00
+  [OK] B: 201 Created, total 21970.00 (2*7990.00 + 5990.00, Decimal-строка) :: {"id":1,"status":"created","total":"21970.00","created_at":"2026-10-29T09:13:26.288206Z","items":[{"product_size_id":201
+  [OK] B: снимки цен 7990.00 и 5990.00 в позициях :: [{'product_size_id': 201, 'quantity': 1, 'price_at_purchase': '5990.00', 'subtotal': '5990.00'}, {'product_size_id': 101, 'quantity': 2, 'price_at_purchase': '7990.00', 'subtotal': '15980.00'}]
+  [OK] B: product_sizes блокируются одним FOR UPDATE ... ORDER BY product_sizes.id :: EGER, %(ID_1_2)S::INTEGER) ORDER BY PRODUCT_SIZES.ID FOR UPDATE OF PRODUCT_SIZES
+  [OK] B: products — один FOR SHARE ... ORDER BY products.id
+  [OK] B: UPDATE stock выполнены в порядке 101, затем 201 (не в порядке корзины) :: [101, 201]
+  [OK] B: протокол users -> sizes -> products -> записи :: ['users', 'sizes', 'products', 'insert']
+  [OK] B: stock 101 3 -> 1, 201 5 -> 4, корзина Бориса пуста, корзина Ани цела
+
+=== C. риск слепого повтора после потери ответа (демонстрация) ===
+  допустим, ответ 201 на заказ Бориса до клиента не дошёл, и он повторяет
+  [OK] C1: повтор с пустой корзиной -> 409 Cart is empty (тот же ответ, что и у того, кто не покупал вовсе) :: {"detail":"Cart is empty"}
+  а теперь корзину успели снова наполнить (другая вкладка/устройство)
+  [OK] Борис: POST /cart/items 301 x1 -> 200 :: код 200 {"id":5,"product_size_id":301,"product_id":30,"name":"North Trail","size":"42.0","price":"9990.00","
+  [OK] C2: слепой повтор при наполненной корзине создаёт ВТОРОЙ заказ (201) — сервер не может отличить повтор от новой покупки :: код 201
+  GET /orders Бориса: [(2, '9990.00'), (1, '21970.00')]
+  [OK] C3: сверка по истории: оба заказа видны клиенту в GET /orders
+
+  временная БД удалена: sneaker_m5rev_18ixrb
+  [OK] рабочая БД не изменилась
+  [OK] в отчёте нет токенов и пароля
+
+ALL M5 REVIEW CHECKS PASSED
+
+ShopError OrderStockConflict -> 409: Not enough stock for product size 201: requested 1, available 0
+ShopError CartEmptyConflict -> 409: Cart is empty

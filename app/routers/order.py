@@ -11,14 +11,14 @@
 # ждёт на product_sizes FOR UPDATE и после commit первого получает 409
 # (проверено `_checkout_race_probe.py`).
 #
-# Роутер подключается только там, где разрешена запись (store_main), чтобы
-# контрольная точка M2 осталась «только чтение каталога».
+# Роутер подключается только там, где разрешена запись (final_main), чтобы
+# сборка M2 (include_writes=False) осталась «только чтение каталога».
 
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Path, Query, status
 
-from app.routers.auth import get_current_admin_id, get_current_user_id
+from app.dependencies import get_current_admin_id, get_current_user_id
 from app.schemas.order import OrderCreate, OrderListParams, OrderRead, OrderStatusUpdate
 from app.services import shop as shop_service
 

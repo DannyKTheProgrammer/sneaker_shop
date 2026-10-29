@@ -9,6 +9,10 @@ Pydantic 2; пароли — passlib[bcrypt], токены — python-jose (JWT 
 заказов; смена статуса заказа администратором (`created → processing →
 completed`).
 
+## Демонстрация
+
+Видео работы API в Swagger UI: <https://www.loom.com/share/dc635467fa70422f99028c456637c048>
+
 ## Требования
 
 | Что | Нужно | Реально проверено |
@@ -213,20 +217,22 @@ docker compose down      # удалить контейнер, именованн
 | [`app/core/security.py`](app/core/security.py) | bcrypt-хэши паролей, выдача и проверка JWT |
 | [`app/core/errors.py`](app/core/errors.py) | бизнес-ошибки → безопасный `{"detail": "..."}` |
 | [`app/database.py`](app/database.py) | Engine, фабрика сессий, `get_session` |
+| [`app/dependencies.py`](app/dependencies.py) | зависимости FastAPI: сессия на запрос, текущий пользователь из JWT, `require_admin` |
 | [`app/models/entities.py`](app/models/entities.py) | ORM-модели семи таблиц |
 | [`app/schemas/`](app/schemas/) | Pydantic-схемы запросов и ответов |
-| [`app/routers/`](app/routers/) | HTTP-маршруты; зависимости входа и роли — в [`app/routers/auth.py`](app/routers/auth.py) |
-| [`app/services/shop.py`](app/services/shop.py) | корзина и заказы, менеджер транзакции `transaction()` |
+| [`app/routers/`](app/routers/) | HTTP-маршруты |
+| [`app/services/shop.py`](app/services/shop.py) | корзина и заказы |
+| [`app/services/unit_of_work.py`](app/services/unit_of_work.py) | `transaction()`: свежая сессия, READ COMMITTED, локальные таймауты, один commit/rollback, 409 `concurrent_change_retry` |
 | [`app/services/catalog.py`](app/services/catalog.py), [`app/services/auth.py`](app/services/auth.py) | каталог и пользователи |
 | [`app/seed.py`](app/seed.py) | идемпотентный seed каталога |
 | [`app/promote_admin.py`](app/promote_admin.py) | выдача роли администратора |
-| [`alembic/versions/201c8afcccba_initial.py`](alembic/versions/201c8afcccba_initial.py) | единственная миграция (семь таблиц) |
+| [`alembic/versions/0001_initial.py`](alembic/versions/0001_initial.py) | единственная миграция (семь таблиц), ревизия `201c8afcccba` |
 | [`compose.yaml`](compose.yaml) | PostgreSQL 17, порт `127.0.0.1:55433`, том `pgdata` |
 | [`setup_jwt.py`](setup_jwt.py) | генерация локального `JWT_SECRET` |
 
-Сохранённые учебные точки входа: `app/catalog_main.py` (M2: только чтение
-каталога), `app/store_main.py` и `app/main.py` (та же полная сборка, что и
-`final_main`; оставлены для прежних команд).
+Точка входа одна — `app/final_main.py`. Имя файла миграции — `0001_initial.py`,
+а идентификатор ревизии внутри остался `201c8afcccba`: его хранит таблица
+`alembic_version` уже созданных БД, и смена идентификатора их бы сломала.
 
 ## Типовые ошибки запуска
 

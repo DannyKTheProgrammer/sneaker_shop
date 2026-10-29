@@ -1,0 +1,251 @@
+
+=== 0. своя временная БД и свой сервер ===
+  рабочая БД (не трогаем): sneaker_shop
+  временная БД           : sneaker_m4_5bchzx
+  пароль участников      : не выводится (длина 18 символов)
+  [OK] временная БД создана :: sneaker_m4_5bchzx
+  [OK] alembic upgrade head :: INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 201c8afcccba, initial: семь таблиц магазина (M1)
+  [OK] seed выполнен :: INFO __main__: Seed выполнен: 2 бренда, 3 товара, 4 размера; существующие строки не изменялись
+  [OK] сервер отвечает /health
+
+=== 1. участники: Аня, Борис, администратор ===
+  [OK] Аня: регистрация 201 :: код 201
+  [OK] Борис: регистрация 201 :: код 201
+  [OK] Админ: регистрация 201 :: код 201
+  [OK] Аня: вход 200 :: код 200
+  [OK] Борис: вход 200 :: код 200
+  [OK] Админ: вход 200 :: код 200
+  [OK] администратор подтверждён /auth/me
+
+=== 2. проверки по исходникам (дефекты, которые видно в коде) ===
+  [OK] в сервисе нет begin_nested( (замена commit запрещена)
+  [OK] в сервисе корзины нет UPDATE product_sizes / SET stock
+  [OK] роутер корзины не берёт сессию из Depends(get_session) :: иначе бизнес-операция пошла бы в транзакции авторизации
+  [OK] роутер не использует Depends(require_admin)
+  [OK] в приложении нет вызова create_all(
+  [OK] объявлены все четыре маршрута :: get/post/patch/delete
+  [OK] у PATCH/DELETE путь /items/{item_id}
+  [OK] входы объявлены с extra="forbid" :: 2
+  [OK] количества строгие (StrictInt) и ограничены int4
+  [OK] нет устаревших комментариев про 'следующую часть M4' :: []
+
+=== 3. DTO: контракт ответа и пустая корзина ===
+    Аня      GET    /cart                      с токеном  -> 200 {"items":[],"estimated_total":"0.00"}
+  [OK] Аня: пустая корзина 200, items=[], estimated_total='0.00' :: {"items":[],"estimated_total":"0.00"}
+    Борис    GET    /cart                      с токеном  -> 200 {"items":[],"estimated_total":"0.00"}
+  [OK] Борис: пустая корзина 200, items=[], estimated_total='0.00' :: {"items":[],"estimated_total":"0.00"}
+    Админ    GET    /cart                      с токеном  -> 200 {"items":[],"estimated_total":"0.00"}
+  [OK] Админ: пустая корзина 200, items=[], estimated_total='0.00' :: {"items":[],"estimated_total":"0.00"}
+  [OK] набор ключей корзины ровно {items, estimated_total} :: {'estimated_total', 'items'}
+    Аня      POST   /cart/items                с токеном  -> 200 {"id":1,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","quantity":2,"stock":5,"subtotal":"11980.00"}
+  [OK] POST создания: код 200 :: код 200
+    DTO позиции: {"id": 1, "product_size_id": 201, "product_id": 20, "name": "City Walk", "size": "41.0", "price": "5990.00", "quantity": 2, "stock": 5, "subtotal": "11980.00"}
+  [OK] набор ключей позиции совпадает с контрактом :: {'id', 'subtotal', 'product_size_id', 'quantity', 'product_id', 'price', 'stock', 'name', 'size'}
+  [OK] quantity/stock/id — целые
+  [OK] size/price/subtotal — строки (Decimal в JSON)
+  [OK] price='5990.00', subtotal='11980.00' (2 * 5990) :: 5990.00, 11980.00
+  [OK] в ответе нет user_id и hashed_password
+  [OK] GET /cart: одна позиция и estimated_total='11980.00' :: {"items":[{"id":1,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","quantity":2,"stock":5,"subtotal":"11980.00"}],"estimated_total":"11980.00"}
+  [OK] в позиции есть stock (информационно)
+
+=== 4. 401 без входа на всех четырёх маршрутах ===
+    аноним   GET    /cart                      БЕЗ токена -> 401 {"detail":"Not authenticated"}
+  [OK] 401: GET /cart :: код 401
+  [OK] 401: GET /cart отдаёт WWW-Authenticate :: Bearer
+    аноним   POST   /cart/items                БЕЗ токена -> 401 {"detail":"Not authenticated"}
+  [OK] 401: POST /cart/items :: код 401
+  [OK] 401: POST /cart/items отдаёт WWW-Authenticate :: Bearer
+    аноним   PATCH  /cart/items/1              БЕЗ токена -> 401 {"detail":"Not authenticated"}
+  [OK] 401: PATCH /cart/items/1 :: код 401
+  [OK] 401: PATCH /cart/items/1 отдаёт WWW-Authenticate :: Bearer
+    аноним   DELETE /cart/items/1              БЕЗ токена -> 401 {"detail":"Not authenticated"}
+  [OK] 401: DELETE /cart/items/1 :: код 401
+  [OK] 401: DELETE /cart/items/1 отдаёт WWW-Authenticate :: Bearer
+  [OK] 401 с мусорным токеном: GET /cart :: код 401
+  [OK] 401 с мусорным токеном: DELETE /cart/items/1 :: код 401
+  [OK] после всех 401 состояние БД не изменилось
+
+=== 5. владелец только из JWT: user_id в запросе не работает ===
+    Борис    GET    /cart?user_id=1            с токеном  -> 200 {"items":[],"estimated_total":"0.00"}
+  [OK] GET /cart?user_id=<чужой> возвращает СВОЮ пустую корзину :: {"items":[],"estimated_total":"0.00"}
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"extra_forbidden","loc":["body","user_id"],"msg":"Extra inputs are not permitted"}]}
+  [OK] PATCH с лишним user_id: 422 :: код 422
+  [OK] PATCH с лишним user_id: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"extra_forbidden","loc":["body","user_id"],"msg":"Extra inputs are not permitted"}]}
+  [OK] POST с лишним user_id: 422 :: код 422
+  [OK] POST с лишним user_id: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"extra_forbidden","loc":["body","price"],"msg":"Extra inputs are not permitted"}]}
+  [OK] POST с лишним price: 422 :: код 422
+  [OK] POST с лишним price: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"extra_forbidden","loc":["body","product_size_id"],"msg":"Extra inputs are not permitted"}]}
+  [OK] PATCH с лишним product_size_id: 422 :: код 422
+  [OK] PATCH с лишним product_size_id: состояние БД не изменилось
+
+=== 6. строгие целые и границы int4 -> 422 ===
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","quantity"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] POST quantity=0: 422 :: код 422
+  [OK] POST quantity=0: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","quantity"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] PATCH quantity=0: 422 :: код 422
+  [OK] PATCH quantity=0: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","quantity"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] POST quantity=-1: 422 :: код 422
+  [OK] POST quantity=-1: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","quantity"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] PATCH quantity=-1: 422 :: код 422
+  [OK] PATCH quantity=-1: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] POST quantity=1.5: 422 :: код 422
+  [OK] POST quantity=1.5: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] PATCH quantity=1.5: 422 :: код 422
+  [OK] PATCH quantity=1.5: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] POST quantity='2': 422 :: код 422
+  [OK] POST quantity='2': состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] PATCH quantity='2': 422 :: код 422
+  [OK] PATCH quantity='2': состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] POST quantity=True: 422 :: код 422
+  [OK] POST quantity=True: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] PATCH quantity=True: 422 :: код 422
+  [OK] PATCH quantity=True: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"less_than_equal","loc":["body","quantity"],"msg":"Input should be less than or equal to 2147483647"}]}
+  [OK] POST quantity=2147483648: 422 :: код 422
+  [OK] POST quantity=2147483648: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"less_than_equal","loc":["body","quantity"],"msg":"Input should be less than or equal to 2147483647"}]}
+  [OK] PATCH quantity=2147483648: 422 :: код 422
+  [OK] PATCH quantity=2147483648: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] POST quantity=None: 422 :: код 422
+  [OK] POST quantity=None: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] PATCH quantity=None: 422 :: код 422
+  [OK] PATCH quantity=None: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"missing","loc":["body","quantity"],"msg":"Field required"}]}
+  [OK] POST без quantity: 422 :: код 422
+  [OK] POST без quantity: состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 422 {"detail":[{"type":"missing","loc":["body","quantity"],"msg":"Field required"}]}
+  [OK] PATCH без quantity: 422 :: код 422
+  [OK] PATCH без quantity: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","product_size_id"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] POST product_size_id=0: 422 :: код 422
+  [OK] POST product_size_id=0: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["body","product_size_id"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] POST product_size_id=-1: 422 :: код 422
+  [OK] POST product_size_id=-1: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"less_than_equal","loc":["body","product_size_id"],"msg":"Input should be less than or equal to 2147483647"}]}
+  [OK] POST product_size_id=2147483648: 422 :: код 422
+  [OK] POST product_size_id=2147483648: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","product_size_id"],"msg":"Input should be a valid integer"}]}
+  [OK] POST product_size_id='201': 422 :: код 422
+  [OK] POST product_size_id='201': состояние БД не изменилось
+    Аня      PATCH  /cart/items/abc            с токеном  -> 422 {"detail":[{"type":"int_parsing","loc":["path","item_id"],"msg":"Input should be a valid integer, unable to parse string as an integer"}]}
+  [OK] PATCH некорректный id 'abc': 422 :: код 422
+  [OK] PATCH некорректный id 'abc': состояние БД не изменилось
+    Аня      PATCH  /cart/items/0              с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["path","item_id"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] PATCH некорректный id '0': 422 :: код 422
+  [OK] PATCH некорректный id '0': состояние БД не изменилось
+    Аня      PATCH  /cart/items/-1             с токеном  -> 422 {"detail":[{"type":"greater_than_equal","loc":["path","item_id"],"msg":"Input should be greater than or equal to 1"}]}
+  [OK] PATCH некорректный id '-1': 422 :: код 422
+  [OK] PATCH некорректный id '-1': состояние БД не изменилось
+    Аня      PATCH  /cart/items/2147483648     с токеном  -> 422 {"detail":[{"type":"less_than_equal","loc":["path","item_id"],"msg":"Input should be less than or equal to 2147483647"}]}
+  [OK] PATCH некорректный id '2147483648': 422 :: код 422
+  [OK] PATCH некорректный id '2147483648': состояние БД не изменилось
+    Аня      PATCH  /cart/items/1.5            с токеном  -> 422 {"detail":[{"type":"int_parsing","loc":["path","item_id"],"msg":"Input should be a valid integer, unable to parse string as an integer"}]}
+  [OK] PATCH некорректный id '1.5': 422 :: код 422
+  [OK] PATCH некорректный id '1.5': состояние БД не изменилось
+
+=== 7. принадлежность: чужой и несуществующий id -> 404 (у админа тоже) ===
+    Борис    PATCH  /cart/items/1              с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] Борис: PATCH чужой позиции: 404 :: код 404
+  [OK] Борис: PATCH чужой позиции: состояние БД не изменилось
+    Борис    DELETE /cart/items/1              с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] Борис: DELETE чужой позиции: 404 :: код 404
+  [OK] Борис: DELETE чужой позиции: состояние БД не изменилось
+    Админ    PATCH  /cart/items/1              с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] Админ: PATCH чужой позиции: 404 :: код 404
+  [OK] Админ: PATCH чужой позиции: состояние БД не изменилось
+    Админ    DELETE /cart/items/1              с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] Админ: DELETE чужой позиции: 404 :: код 404
+  [OK] Админ: DELETE чужой позиции: состояние БД не изменилось
+    Аня      PATCH  /cart/items/999999         с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] PATCH несуществующего id: 404 :: код 404
+  [OK] PATCH несуществующего id: состояние БД не изменилось
+    Аня      DELETE /cart/items/999999         с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] DELETE несуществующего id: 404 :: код 404
+  [OK] DELETE несуществующего id: состояние БД не изменилось
+  [OK] после всех 404 позиция Ани цела :: [(1, 1, 201, 2)]
+
+=== 8. тело отказа не выдаёт внутренности ===
+    404      DELETE /cart/items/1              с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] 404: ошибка не содержит SQL/имён ограничений/traceback :: {"detail":"Cart item not found"}
+    409      POST   /cart/items                с токеном  -> 409 {"detail":"Only 0 item(s) of this size are in stock"}
+  [OK] 409: ошибка не содержит SQL/имён ограничений/traceback :: {"detail":"Only 0 item(s) of this size are in stock"}
+    422      POST   /cart/items                с токеном  -> 422 {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] 422: ошибка не содержит SQL/имён ограничений/traceback :: {"detail":[{"type":"int_type","loc":["body","quantity"],"msg":"Input should be a valid integer"}]}
+  [OK] 404 для чужой и несуществующей позиции одинаков :: {"detail":"Cart item not found"}
+
+=== 9. нехватка остатка -> 409 (и ничего не меняется) ===
+    Аня      POST   /cart/items                с токеном  -> 409 {"detail":"Only 0 item(s) of this size are in stock"}
+  [OK] POST size 102 (stock 0): 409 :: код 409
+  [OK] POST size 102 (stock 0): состояние БД не изменилось
+    Аня      PATCH  /cart/items/1              с токеном  -> 409 {"detail":"Only 5 item(s) of this size are in stock"}
+  [OK] PATCH quantity=6 при stock 5: 409 :: код 409
+  [OK] PATCH quantity=6 при stock 5: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 409 {"detail":"Only 5 item(s) of this size are in stock"}
+  [OK] POST +4 при остатке 2 из 5: 409 :: код 409
+  [OK] POST +4 при остатке 2 из 5: состояние БД не изменилось
+    Аня      POST   /cart/items                с токеном  -> 404 {"detail":"Product size not found"}
+  [OK] POST несуществующего размера: 404 :: код 404
+  [OK] POST несуществующего размера: состояние БД не изменилось
+
+=== 10. UNIQUE пары и увеличение при повторе ===
+  [OK] пара (user, size) описана ОДНОЙ строкой :: [(1, 1, 201, 2)]
+    Аня      POST   /cart/items                с токеном  -> 200 {"id":1,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","quantity":3,"stock":5,"subtotal":"17970.00"}
+  [OK] повторный POST: 200 и quantity=3 (2 + 1) :: код 200, quantity=3
+  [OK] id строки не изменился (второй строки нет)
+  [OK] в таблице по-прежнему одна строка пары :: [(1, 1, 201, 3)]
+
+=== 11. PATCH — абсолютное количество, DELETE — 204 без тела ===
+    Аня      PATCH  /cart/items/1              с токеном  -> 200 {"id":1,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","quantity":5,"stock":5,"subtotal":"29950.00"}
+  [OK] PATCH quantity=5 -> 200 и quantity=5 (не 3 + 5 = 8) :: код 200, 5
+  [OK] subtotal пересчитан: 5 * 5990 = '29950.00' :: 29950.00
+  [OK] GET /cart после PATCH: estimated_total='29950.00' :: {"items":[{"id":1,"product_size_id":201,"product_id":20,"name":"City Walk","size":"41.0","price":"5990.00","quantity":5,"stock":5,"subtotal":"29950.00"}],"estimated_total":"29950.00"}
+    Аня      DELETE /cart/items/1              с токеном  -> 204 
+  [OK] DELETE -> 204 :: код 204
+  [OK] DELETE: тело пустое :: ''
+  [OK] DELETE: заголовка Content-Length нет или он равен 0 :: None
+  [OK] строка удалена из БД :: []
+  [OK] GET /cart после DELETE: пусто и '0.00' :: {"items":[],"estimated_total":"0.00"}
+    Аня      DELETE /cart/items/1              с токеном  -> 404 {"detail":"Cart item not found"}
+  [OK] повторный DELETE: 404 :: код 404
+  [OK] повторный DELETE: состояние БД не изменилось
+
+=== 12. корзина не резервирует остаток; заказы не появляются ===
+  [OK] остатки не изменились: 101=3, 102=0, 201=5, 301=2 :: [(101, 3), (102, 0), (201, 5), (301, 2)]
+  [OK] orders=0, order_items=0 :: 0/0
+
+=== 13. посторонние методы и пути ===
+  [OK] POST /cart -> 405 :: код 405
+  [OK] GET /cart/items -> 405 :: код 405
+  [OK] PUT /cart/items/{id} -> 405 :: код 405
+
+=== 14. схема БД и ревизия не менялись ===
+  [OK] 8 таблиц :: ['alembic_version', 'brands', 'cart_items', 'order_items', 'orders', 'product_sizes', 'products', 'users']
+  [OK] 7 внешних ключей :: 7
+  [OK] 4 UNIQUE (включая uq_cart_size) :: 4
+  [OK] 8 именованных CHECK :: 40
+  [OK] ревизия 201c8afcccba :: 201c8afcccba
+
+  временная БД удалена: sneaker_m4_5bchzx
+  [OK] в отчёте нет токенов
+  [OK] в отчёте нет пароля
+  [OK] в отчёте нет 'eyJ'
+
+ALL M4 REVIEW CHECKS PASSED
+

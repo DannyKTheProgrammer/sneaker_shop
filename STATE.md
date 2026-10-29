@@ -26,8 +26,8 @@ M6. Версия API `0.13.0`. Итоги, статус дефектов и чт
 `127.0.0.1:55433` недоступен, и проверить ничего нельзя (в части 2 так и
 случилось: пришлось ждать, пока ученик запустит Docker).
 
-Данные ученика в рабочей БД: `users` — три строки (`danny@gmail.com`,
-`admin@example.com` и `danny@gmail.comm`, созданная вручную в его
+Данные ученика в рабочей БД: `users` — три строки (`<email ученика 1>`,
+`admin@example.com` и `<email ученика 2>`, созданная вручную в его
 приложении на 8000). `cart_items` пуст; **`orders=1`, `order_items=2`**:
 заказ `id=1` (`user_id=4`, 101×2 + 201×1, `21970.00`, статус `created`)
 ученик создал сам 2026-10-28 в 12:09 (местное время), отлаживая
@@ -66,7 +66,7 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
 * Данные в рабочей БД (2026-10-28): `brands=2`, `products=3`,
   `product_sizes=4` (stock 101=1, 102=0, 201=4, 301=2), `orders=1`,
   `order_items=2`; в `users` — три записи, созданные учеником вручную
-  (`danny@gmail.com`, `admin@example.com`, `danny@gmail.comm`);
+  (`<email ученика 1>`, `admin@example.com`, `<email ученика 2>`);
   `cart_items=0`. Заказ и изменённые остатки — от отладки ученика. Это не
   мусор проверок: не удалять и не строить на «пустой рабочей БД» никаких
   утверждений (см. правило 17). Неизменность рабочей БД в проверках
@@ -110,11 +110,28 @@ PostgreSQL — в Docker Compose. Реальные секреты в переп�
 ревью (B2, N1–N6, `app/schemas/money.py`) на момент записи **не
 закоммичены**.
 
-**Соответствие файлов эталону (переименовывать не нужно):**
-`dependencies.py` → зависимости в `app/routers/auth.py`;
-`services/unit_of_work.py` → `shop.transaction()`;
-`alembic/versions/0001_initial.py` → `201c8afcccba_initial.py`
-(переименование сломало бы `alembic_version`).
+**Приведение к файлам эталона (2026-10-29, по решению ученика):**
+* `app/dependencies.py` — `SessionDep`, `get_current_user`, `CurrentUser`,
+  `get_current_user_id`, `get_current_admin_id`, `require_admin`,
+  `AdminUser` перенесены из `app/routers/auth.py` без изменения логики;
+  `SessionDep` больше не дублируется в `catalog.py`/`catalog_write.py`.
+* `app/services/unit_of_work.py` — `transaction()`, `ConcurrentChangeConflict`,
+  `RETRYABLE_SQLSTATES`, таймауты, `_sqlstate`, `_rollback_quietly`
+  перенесены из `shop.py`; `shop` импортирует `transaction`, поэтому
+  `shop.transaction()` в пробах продолжает работать. `_FAULT_HOOK` и
+  `new_session` остались в `shop.py`.
+* Миграция: файл переименован `git mv` в `alembic/versions/0001_initial.py`,
+  **идентификатор ревизии оставлен `201c8afcccba`** — его хранит
+  `alembic_version` рабочей БД; `alembic heads/current` = `201c8afcccba`,
+  `alembic check` чистый.
+* Старые точки входа `app/main.py`, `app/catalog_main.py`, `app/store_main.py`
+  удалены. Единственная точка входа — `app.final_main:app`. Сборка M2
+  «только чтение» осталась как `build_app(include_writes=False)`;
+  регрессия поднимает её на 8002 через `python -c "... uvicorn.run(...)"`.
+  Пробы переключены с `app.store_main`/`app.main` на `app.final_main`.
+  **Команда разработки ученика `uvicorn app.main:app --reload` больше не
+  работает** — заменить на `app.final_main:app`.
+* В STATE.md e-mail ученика заменены на `<email ученика N>`.
 
 **Статус дефектов и пунктов ревью:**
 

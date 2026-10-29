@@ -5,23 +5,17 @@
 # маршрут зарегистрирован в этом файле, он админский по построению; GET-ы
 # живут в app/routers/catalog.py и остаются публичными.
 #
-# Роутер подключается только там, где запись разрешена (app/store_main.py).
-# Контрольная точка M2 (app/catalog_main.py) его не подключает, поэтому её
+# Роутер подключается только там, где запись разрешена (app/final_main.py).
+# Сборка M2 (build_app(include_writes=False)) его не подключает, поэтому её
 # OpenAPI по-прежнему содержит только GET.
 
-from typing import Annotated
-
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy.orm import Session
 
-from app.database import get_session
-from app.routers.auth import require_admin
+from app.dependencies import SessionDep, require_admin
 from app.schemas.catalog import ProductRead, ProductWrite
 from app.services import catalog as catalog_service
 
 router = APIRouter(tags=["catalog"], dependencies=[Depends(require_admin)])
-
-SessionDep = Annotated[Session, Depends(get_session)]
 
 
 def _conflict(exc: Exception) -> HTTPException:
