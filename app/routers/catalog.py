@@ -23,7 +23,7 @@ router = APIRouter(tags=["catalog"])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-@router.get("/brands", response_model=list[BrandRead], summary="Список брендов")
+@router.get("/brands", summary="Список брендов")
 def list_brands(session: SessionDep) -> list[BrandRead]:
     """Вернуть все бренды, отсортированные по id.
 
@@ -33,7 +33,7 @@ def list_brands(session: SessionDep) -> list[BrandRead]:
     return catalog_service.list_brands(session)
 
 
-@router.get("/products", response_model=list[ProductRead], summary="Список товаров")
+@router.get("/products", summary="Список товаров")
 def list_products(
     session: SessionDep,
     filters: Annotated[ProductFilters, Query()],
@@ -65,7 +65,6 @@ def list_products(
 
 @router.get(
     "/products/{product_id}",
-    response_model=ProductRead,
     summary="Карточка товара",
     responses={404: {"description": "Товара с таким id нет"}},
 )

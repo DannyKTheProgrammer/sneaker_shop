@@ -3,6 +3,10 @@
 # Здесь сознательно нет ни FastAPI, ни HTTP-ошибок: сервис отвечает на
 # вопрос «что лежит в БД», а решение «404/422/409» принимает роутер.
 # Так сервис можно переиспользовать и тестировать без HTTP.
+#
+# Публичные функции возвращают Pydantic DTO (BrandRead, ProductRead), а не
+# ORM-объекты: ORM -> DTO выполняется здесь, пока сессия открыта и sizes
+# загружены через selectinload. Наружу ORM не уходит.
 
 from dataclasses import dataclass
 from decimal import Decimal
@@ -12,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import Brand, CartItem, OrderItem, Product, ProductSize
-from app.schemas.catalog import ProductWrite
+from app.schemas.catalog import BrandRead, ProductRead, ProductWrite
 
 
 class CatalogError(Exception):
@@ -98,16 +102,17 @@ def _product_filters(filters: ProductFilters) -> list:
     return conditions
 
 
-def list_brands(session: Session) -> list[Brand]:
+def list_brands(session: Session) -> list[BrandRead]:
     """Все бренды, отсортированные по id.
 
     Сортировка задана явно: порядок строк в PostgreSQL без ORDER BY
     не определён, и ответ мог бы «прыгать» между запросами.
     """
-    return list(session.scalars(select(Brand).order_by(Brand.id)))
+    brands = session.scalars(select(Brand).order_by(Brand.id))
+    return [BrandRead.model_validate(brand) for brand in brands]
 
 
-def list_products(session: Session, filters: ProductFilters | None = None) -> list[Product]:
+def list_products(session: Session, filters: ProductFilters | None = None) -> list[ProductRead]:
     """Товары с размерами: фильтры через AND, сортировка, затем LIMIT/OFFSET.
 
     selectinload(Product.sizes) — ключевая деталь. Без него обращение
@@ -134,13 +139,15 @@ def list_products(session: Session, filters: ProductFilters | None = None) -> li
 
     # ORDER BY до LIMIT/OFFSET — иначе LIMIT отрезал бы произвольные строки.
     stmt = stmt.order_by(Product.id).limit(active.limit).offset(active.offset)
-    return list(session.scalars(stmt))
+    # ORM -> DTO, пока сессия открыта и sizes уже загружены selectinload.
+    return [ProductRead.model_validate(product) for product in session.scalars(stmt)]
 
 
-def get_product(session: Session, product_id: int) -> Product | None:
-    """Один товар с размерами или None, если такого id нет.
+def _load_product(session: Session, product_id: int) -> Product | None:
+    """ORM-товар с размерами или None, если такого id нет.
 
-    None, а не исключение: сервис не знает, что для HTTP это 404.
+    Внутренний хелпер: ORM-объект нужен create/update (изменять поля,
+    перечитывать после commit) и наружу не отдаётся.
     """
     stmt = (
         select(Product)
@@ -148,6 +155,17 @@ def get_product(session: Session, product_id: int) -> Product | None:
         .where(Product.id == product_id)
     )
     return session.scalars(stmt).first()
+
+
+def get_product(session: Session, product_id: int) -> ProductRead | None:
+    """Один товар с размерами (DTO) или None, если такого id нет.
+
+    None, а не исключение: сервис не знает, что для HTTP это 404.
+    """
+    product = _load_product(session, product_id)
+    if product is None:
+        return None
+    return ProductRead.model_validate(product)
 
 
 # --- запись каталога (M3) -------------------------------------------------
@@ -185,7 +203,7 @@ def _commit(session: Session, conflict_message: str) -> None:
         raise CatalogConflict(conflict_message) from exc
 
 
-def create_product(session: Session, data: ProductWrite) -> Product:
+def create_product(session: Session, data: ProductWrite) -> ProductRead:
     """Создать карточку товара по валидированным данным.
 
     Порядок: проверить бренд → вставить → commit → вернуть карточку с
@@ -213,13 +231,13 @@ def create_product(session: Session, data: ProductWrite) -> Product:
     # Перечитываем с размерами: после commit объект просрочен, а sizes
     # нужны для ответа — ленивая загрузка здесь была бы лишним запросом
     # (или ошибкой, если сессия уже закрыта).
-    created = get_product(session, product.id)
+    created = _load_product(session, product.id)
     if created is None:  # pragma: no cover - сразу после commit строки быть не может
         raise ProductNotFound("product disappeared right after creation")
-    return created
+    return ProductRead.model_validate(created)
 
 
-def update_product(session: Session, product_id: int, data: ProductWrite) -> Product:
+def update_product(session: Session, product_id: int, data: ProductWrite) -> ProductRead:
     """Заменить редактируемые поля карточки (полный контракт, не PATCH).
 
     Обязательные name/brand_id/price и defaults у description/image_url уже
@@ -230,7 +248,7 @@ def update_product(session: Session, product_id: int, data: ProductWrite) -> Pro
     sizes не редактируются и не удаляются: строки product_sizes живут
     отдельно, здесь по ним не выполняется ни одного оператора.
     """
-    product = get_product(session, product_id)
+    product = _load_product(session, product_id)
     if product is None:
         raise ProductNotFound(f"product {product_id} does not exist")
 
@@ -248,10 +266,10 @@ def update_product(session: Session, product_id: int, data: ProductWrite) -> Pro
 
     _commit(session, "product could not be updated: integrity conflict")
 
-    updated = get_product(session, product_id)
+    updated = _load_product(session, product_id)
     if updated is None:  # pragma: no cover - строку никто не удалял
         raise ProductNotFound(f"product {product_id} disappeared during update")
-    return updated
+    return ProductRead.model_validate(updated)
 
 
 def _size_ids(session: Session, product_id: int) -> list[int]:

@@ -35,7 +35,6 @@ def _conflict(exc: Exception) -> HTTPException:
 
 @router.post(
     "/products",
-    response_model=ProductRead,
     status_code=status.HTTP_201_CREATED,
     summary="Создать товар (только администратор)",
     responses={
@@ -61,7 +60,6 @@ def create_product(payload: ProductWrite, session: SessionDep) -> ProductRead:
 
 @router.put(
     "/products/{product_id}",
-    response_model=ProductRead,
     summary="Заменить карточку товара (только администратор)",
     responses={
         401: {"description": "Токен отсутствует или недействителен"},
