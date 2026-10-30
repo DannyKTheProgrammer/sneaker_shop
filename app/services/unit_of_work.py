@@ -1,7 +1,7 @@
 # Единица работы: одна операция = одна свежая сессия = одна транзакция.
 # Сервисы (app/services/shop.py) входят в `transaction()` и сами не коммитят.
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 
 from sqlalchemy import text
@@ -53,7 +53,7 @@ def _rollback_quietly(session: Session) -> None:
 
 
 @contextmanager
-def transaction() -> Iterator[Session]:
+def transaction() -> Generator[Session, None, None]:
     """Открыть свежую сессию с транзакцией READ COMMITTED на одну бизнес-операцию.
 
     Commit при нормальном выходе, rollback при исключении, close всегда.

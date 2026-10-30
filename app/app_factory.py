@@ -1,7 +1,7 @@
 # Сборка приложения; include_writes управляет подключением роутеров записи.
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, status
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     """Освободить пул соединений при остановке приложения.
 
     При жёстком убийстве процесса (Windows) код не выполняется.
