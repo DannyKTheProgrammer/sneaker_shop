@@ -36,6 +36,9 @@ _*_fixtures.py
 _logging.json
 sql/
 
+# --- локальные заметки ---
+STATE.md
+
 # --- тесты и инструменты ---
 .pytest_cache/
 .mypy_cache/
