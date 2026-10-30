@@ -1,13 +1,4 @@
-# Запись каталога (M3): создание, замена и удаление товара.
-#
-# Все три маршрута защищены require_admin — это одна зависимость на весь
-# роутер, а не проверка внутри каждого обработчика. Отсюда правило: если
-# маршрут зарегистрирован в этом файле, он админский по построению; GET-ы
-# живут в app/routers/catalog.py и остаются публичными.
-#
-# Роутер подключается только там, где запись разрешена (app/final_main.py).
-# Сборка M2 (build_app(include_writes=False)) его не подключает, поэтому её
-# OpenAPI по-прежнему содержит только GET.
+# Запись каталога; require_admin стоит на весь роутер.
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
@@ -19,11 +10,7 @@ router = APIRouter(tags=["catalog"], dependencies=[Depends(require_admin)])
 
 
 def _conflict(exc: Exception) -> HTTPException:
-    """Перевести конфликт сервиса в 409.
-
-    Ссылка из истории/корзины — это конфликт состояния, а не ошибка
-    клиента в данных, поэтому 409, а не 422.
-    """
+    """Перевести конфликт сервиса в 409."""
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
@@ -39,11 +26,7 @@ def _conflict(exc: Exception) -> HTTPException:
     },
 )
 def create_product(payload: ProductWrite, session: SessionDep) -> ProductRead:
-    """Создать карточку товара.
-
-    Размеры не создаются: их источник — seed, контракт ProductWrite их не
-    принимает (extra="forbid"), поэтому у нового товара sizes пустой.
-    """
+    """Создать карточку товара без размеров (ProductWrite их не принимает)."""
     try:
         return catalog_service.create_product(session, payload)
     except catalog_service.BrandNotFound as exc:
@@ -64,11 +47,9 @@ def create_product(payload: ProductWrite, session: SessionDep) -> ProductRead:
     },
 )
 def update_product(product_id: int, payload: ProductWrite, session: SessionDep) -> ProductRead:
-    """Полная замена редактируемых полей (не PATCH).
+    """Полная замена полей (не PATCH): пропущенные description и image_url сбрасываются.
 
-    Порядок отказов: сначала 404 (нет товара — обновлять нечего), затем 409
-    (товар есть, но бренд невалиден). Пропущенные description и image_url
-    сбрасываются к '' и null — так работает контракт PUT.
+    Сначала 404 (нет товара), затем 409 (неверный бренд).
     """
     try:
         return catalog_service.update_product(session, product_id, payload)
@@ -93,12 +74,7 @@ def update_product(product_id: int, payload: ProductWrite, session: SessionDep) 
     },
 )
 def delete_product(product_id: int, session: SessionDep) -> Response:
-    """Удалить товар и его размеры одной транзакцией.
-
-    Если на любой размер ссылается cart_items или order_items — 409 и
-    полный откат: ни карточка, ни размеры, ни ссылки не меняются. Успех —
-    204 с пустым телом, повторный DELETE того же id — 404.
-    """
+    """Удалить товар и его размеры; ссылки из корзины или заказов дают 409 и полный откат."""
     try:
         catalog_service.delete_product(session, product_id)
     except catalog_service.ProductNotFound as exc:

@@ -1,17 +1,5 @@
-# Ошибки бизнес-уровня и их безопасный перевод в HTTP (M4: корзина).
-#
-# Зачем общий тип: сервис не должен импортировать FastAPI (правило
-# «в сервисе нет HTTP-ошибок»), но HTTP-слой всё равно обязан отличать
-# «не найдено» (404) от «конфликт состояния» (409) и «ошибка данных» (422).
-# Поэтому исключение несёт только два безопасных факта:
-#
-#   status_code — каким HTTP-кодом это показать клиенту;
-#   detail      — короткий текст для поля "detail", БЕЗ имён ограничений БД,
-#                 SQL, параметров и traceback.
-#
-# Имена таблиц/ограничений и текст исключения драйвера наружу не уходят
-# никогда: по ним клиент узнаёт устройство схемы. Они остаются в логах
-# сервера (logger.exception), где их видит разработчик.
+# Бизнес-ошибки без зависимости от FastAPI: несут только status_code и detail.
+# Имена ограничений БД, SQL и traceback наружу не уходят, только в логи.
 
 import logging
 from http import HTTPStatus
@@ -23,12 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class ShopError(Exception):
-    """Базовая ошибка магазина: HTTP-код и безопасный текст ответа.
-
-    Один обработчик на всё дерево исключений (см. shop_error_handler)
-    избавляет от «лестницы except» в каждом маршруте: добавили новый тип
-    ошибки — достаточно указать ей status_code и detail.
-    """
+    """Базовая ошибка магазина: HTTP-код и безопасный detail."""
 
     status_code: int = HTTPStatus.BAD_REQUEST
     detail: str = "Request could not be processed"
@@ -40,32 +23,27 @@ class ShopError(Exception):
 
 
 class ShopNotFound(ShopError):
-    """Запрошенного объекта нет или он принадлежит другому пользователю."""
+    """Объекта нет или он принадлежит другому пользователю (404)."""
 
     status_code = HTTPStatus.NOT_FOUND
     detail = "Not found"
 
 
 class ShopForbidden(ShopError):
-    """Пользователь известен, но прав на операцию нет (403)."""
+    """Нет прав на операцию (403)."""
 
     status_code = HTTPStatus.FORBIDDEN
     detail = "Administrator privileges required"
 
 
 class ShopConflict(ShopError):
-    """Запрос корректен по форме, но состояние данных его не допускает."""
+    """Состояние данных не допускает операцию (409)."""
 
     status_code = HTTPStatus.CONFLICT
     detail = "Conflict"
 
 
 async def shop_error_handler(_request: Request, exc: ShopError) -> JSONResponse:
-    """Единый безопасный ответ на любую ShopError.
-
-    В тело уходит только detail — без класса исключения, без str(exc)
-    «как есть», без SQL и без имени нарушенного ограничения. Сам факт
-    ошибки остаётся в логе сервера: там str(exc) допустим.
-    """
+    """Ответить на ShopError JSON с одним полем detail."""
     logger.warning("ShopError %s -> %s: %s", type(exc).__name__, exc.status_code, exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})

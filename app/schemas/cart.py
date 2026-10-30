@@ -1,21 +1,5 @@
-# Схемы корзины (M4).
-#
-# Вход и выход — два разных контракта, как и в каталоге:
-#
-#   CartItemAdd  — то, что клиент имеет право прислать: размер и количество.
-#                  Ни user_id, ни цены, ни остатка здесь нет: владельца
-#                  берут из проверенного токена, а цену и остаток — из БД.
-#                  Лишнее поле (например, user_id) даёт 422.
-#
-#   CartItemRead — то, что клиент видит в ответе: позиция «как её понимает
-#                  магазин»: размер, товар, цена, остаток и стоимость
-#                  строки (subtotal).
-#
-#   CartRead     — ответ GET /cart: массив позиций и ОРИЕНТИРОВОЧНАЯ сумма
-#                  (estimated_total), посчитанная по текущим ценам каталога.
-#
-# Деньги и размер — Decimal и уходят в JSON строкой ("7990.00", "42.0"):
-# так задано во всём проекте, float для денег не используется.
+# Схемы корзины. Во входных схемах только размер и количество: владелец,
+# цена и остаток берутся из токена и БД, лишние поля дают 422.
 
 from decimal import Decimal
 from typing import Annotated
@@ -24,25 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from app.schemas.money import DecimalStr
 
-# id строки product_sizes: Integer в PostgreSQL = 32 бита.
+# Границы int4.
 PrimaryKey = Annotated[StrictInt, Field(ge=1, le=2147483647)]
 
-# Количество в корзине: целое, не меньше 1 и в пределах int4.
-# Почему strict: 1.0, "1" и true — это не «единица» в JSON, а другой тип.
-# Молчаливое приведение скрыло бы ошибку клиента, поэтому такие значения
-# отклоняются 422. Верхняя граница берётся из типа колонки, а не из
-# остатка: остаток меняется, и «количество больше остатка» — это 409
-# (состояние данных), а не 422 (форма запроса).
+# Strict: 1.0, "1" и true отклоняются. Верхняя граница из int4, не из остатка:
+# превышение остатка — это 409, а не 422.
 Quantity = Annotated[StrictInt, Field(ge=1, le=2147483647)]
 
 
 class CartItemAdd(BaseModel):
-    """Вход POST /cart/items: что добавить и сколько.
-
-    Поле quantity — это ДЕЛЬТА (прибавка) для этого маршрута: 2 означает
-    «добавь ещё две пары», а не «сделай ровно 2». Абсолютную установку
-    делает PATCH /cart/items/{item_id} с CartItemUpdate.
-    """
+    """Вход POST /cart/items; quantity — прибавка, а не итоговое значение."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -51,15 +26,7 @@ class CartItemAdd(BaseModel):
 
 
 class CartItemUpdate(BaseModel):
-    """Вход PATCH /cart/items/{item_id}: АБСОЛЮТНОЕ количество.
-
-    Не путать с CartItemAdd: там quantity — прибавка, здесь — итоговое
-    значение («сделай ровно 3»). Ноль и отрицательные отклоняются схемой
-    (422), потому что в cart_items стоит CHECK quantity > 0: чтобы убрать
-    позицию, её удаляют, а не обнуляют. Лишние поля запрещены: `user_id`,
-    `product_size_id` и `price` не принимаются — владельца берут из токена,
-    а размер и цену позиция уже содержит.
-    """
+    """Вход PATCH /cart/items/{item_id}; quantity — итоговое значение (ноль отклоняется)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -67,7 +34,7 @@ class CartItemUpdate(BaseModel):
 
 
 class CartProductRead(BaseModel):
-    """Товар внутри позиции корзины: только нужные клиенту поля."""
+    """Товар внутри позиции корзины."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -76,11 +43,7 @@ class CartProductRead(BaseModel):
 
 
 class CartSizeRead(BaseModel):
-    """Размер внутри позиции корзины.
-
-    price берётся из ТОВАРА (products.price), а не из размера: в
-    product_sizes цены нет, цена — свойство товара.
-    """
+    """Размер внутри позиции корзины."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -91,21 +54,7 @@ class CartSizeRead(BaseModel):
 
 
 class CartItemRead(BaseModel):
-    """Ответ POST /cart/items: позиция корзины с товаром, ценой и остатком.
-
-    Поля плоские (без вложенных объектов), потому что клиенту нужна одна
-    строка «что лежит в корзине», а не дерево. Собираются они из трёх
-    связанных объектов БД:
-
-      id, quantity          — сама строка cart_items;
-      product_size_id, size, stock — строка product_sizes;
-      product_id, name, price      — карточка products;
-      subtotal              — вычисляемое сервером quantity * price.
-
-    price и subtotal — строки в JSON ("7990.00", "15980.00"). subtotal
-    округлять не нужно: quantity целое, а price уже Decimal с двумя
-    знаками из numeric(10,2), поэтому произведение точное.
-    """
+    """Плоская позиция корзины; subtotal = quantity * price (price берётся из products)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -121,23 +70,7 @@ class CartItemRead(BaseModel):
 
 
 class CartRead(BaseModel):
-    """Ответ GET /cart: своя корзина целиком.
-
-    Две вещи, которые важно не перепутать:
-
-    * `items` — массив без обёртки (как в каталоге), в стабильном порядке
-      возрастания cart_items.id. Пустая корзина — это `[]`, а не 404.
-    * `estimated_total` — ОРИЕНТИРОВОЧНАЯ сумма: сумма subtotal по текущим
-      ценам каталога. Она не зафиксирована нигде в БД и может измениться
-      сама по себе (например, администратор поднял цену) либо при
-      оформлении заказа — поэтому и называется оценкой, а не «итогом».
-
-    `estimated_total` — тоже `DecimalStr` (app/schemas/money.py): строка
-    "7990.00" в JSON, чтобы точность не зависела от клиента.
-
-    `from_attributes` здесь не нужен: объект собирается в коде сервиса из
-    строк JOIN-запроса, а не из ORM-объекта одного вида.
-    """
+    """Ответ GET /cart; estimated_total — оценка по текущим ценам, в БД не хранится."""
 
     items: list[CartItemRead]
     estimated_total: DecimalStr

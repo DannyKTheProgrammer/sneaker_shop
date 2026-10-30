@@ -1,10 +1,5 @@
-# Аутентификация: регистрация и вход (M3).
-#
-# Здесь нет ни FastAPI, ни HTTP-кодов: сервис отвечает за пароль и за
-# строку в таблице users, а «201/401/409/422» решает роутер.
-#
-# Криптография пароля живёт в app/core/security.py и вызывается оттуда:
-# этот модуль отвечает только за БД и правила доступа.
+# Аутентификация: регистрация и вход. Без FastAPI и HTTP-кодов (их выбирает роутер).
+# Хэширование пароля — в app/core/security.py.
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -17,9 +12,7 @@ from app.schemas.auth import UserLogin, UserRegister
 # SQLSTATE нарушения уникальности в PostgreSQL.
 UNIQUE_VIOLATION = "23505"
 
-# Одно и то же сообщение для «нет такого email» и «неверный пароль»:
-# разные тексты позволили бы перебором выяснять, какие адреса
-# зарегистрированы.
+# Одно сообщение для «нет email» и «неверный пароль»: не раскрывает, какие адреса зарегистрированы.
 INVALID_CREDENTIALS_MESSAGE = "Invalid email or password"
 
 
@@ -32,11 +25,11 @@ class EmailAlreadyRegistered(AuthError):
 
 
 class InvalidCredentials(AuthError):
-    """Пользователь не найден ИЛИ пароль не подошёл — без уточнений."""
+    """Пользователь не найден или пароль не подошёл."""
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:
-    """Нарушение уникальности (23505) в драйвере или в его причине."""
+    """Проверить, что это нарушение уникальности (23505)."""
     diag = getattr(getattr(exc, "orig", None), "diag", None)
     if diag is not None and getattr(diag, "sqlstate", None) == UNIQUE_VIOLATION:
         return True
@@ -47,18 +40,10 @@ def _is_unique_violation(exc: IntegrityError) -> bool:
 
 
 def register_user(session: Session, data: UserRegister) -> User:
-    """Зарегистрировать пользователя и вернуть его (без хэша наружу).
+    """Зарегистрировать пользователя.
 
-    Гонка регистрации: предварительный SELECT «есть ли такой email» ничего
-    не гарантирует — между проверкой и вставкой другой запрос успеет
-    вставить тот же адрес. Поэтому единственная настоящая защита —
-    UNIQUE(email) в БД, а IntegrityError мы разбираем после отката:
-    нарушение уникальности (23505) превращается в понятный отказ 409,
-    всё остальное не маскируется.
-
-    is_admin выставляется ЯВНО в False: даже если схема входа когда-нибудь
-    изменится, эта строка не даст создать администратора регистрацией.
-    Публичного маршрута назначения администратора нет вообще.
+    Занятый email определяется по UNIQUE(email) (23505 -> EmailAlreadyRegistered),
+    а не предварительным SELECT: он не защищает от гонки. is_admin всегда False.
     """
     user = User(
         email=str(data.email),
@@ -67,15 +52,11 @@ def register_user(session: Session, data: UserRegister) -> User:
     )
     session.add(user)
     try:
-        # flush отправляет INSERT и сразу ловит нарушение ограничений,
-        # не дожидаясь commit.
         session.flush()
     except IntegrityError as exc:
         session.rollback()
         if _is_unique_violation(exc):
             raise EmailAlreadyRegistered(f"email {user.email} is already registered") from exc
-        # Прочие нарушения целостности (например, NOT NULL) — не про
-        # занятый email, и притворяться иначе нельзя.
         raise
 
     session.commit()
@@ -83,33 +64,18 @@ def register_user(session: Session, data: UserRegister) -> User:
 
 
 def get_user_by_id(session: Session, user_id: int) -> User | None:
-    """Найти пользователя по id (для проверки токена).
-
-    None, а не исключение: решение «401 или 200» принимает зависимость
-    аутентификации, а не сервис.
-    """
+    """Вернуть пользователя по id или None."""
     return session.get(User, user_id)
 
 
 def authenticate_user(session: Session, data: UserLogin) -> User:
-    """Проверить пару email/пароль и вернуть пользователя.
+    """Проверить email и пароль; иначе InvalidCredentials.
 
-    Пароль сверяется ТОЛЬКО через verify_password(введённый, сохранённый
-    хэш): соль лежит внутри сохранённой строки, и сравнивать с ней заново
-    посчитанный хэш нельзя — они разные даже для верного пароля.
-
-    Если email не найден, выполняется ровно та же по стоимости проверка,
-    но против заранее вычисленного dummy_hash. Смысл — не дать отличить
-    «нет такого пользователя» от «неверный пароль» по времени ответа и не
-    выдать существование адреса. Это снижение разницы, а не гарантия
-    постоянного времени: сеть, БД и загрузка машины тоже влияют на ответ.
-
-    Возвращаем ту же ошибку InvalidCredentials в обоих случаях, чтобы текст
-    ответа тоже не подсказывал, что именно не так.
+    Для неизвестного email проверка идёт против dummy_hash, чтобы сгладить
+    разницу во времени ответа.
     """
     user = session.scalars(select(User).where(User.email == str(data.email))).first()
     if user is None:
-        # Проверяем против заглушки и всё равно отказываем.
         verify_password(data.password, dummy_hash())
         raise InvalidCredentials(INVALID_CREDENTIALS_MESSAGE)
 

@@ -1,9 +1,5 @@
-# Маршруты аутентификации (M3: регистрация, вход и проверка токена).
-#
-# Контракт входа — JSON {"email", "password"} → {"access_token", "token_type"}.
-# Это НЕ OAuth2 password form: в Swagger нельзя нажать Authorize и войти
-# автоматически. Порядок такой: вызвать /auth/login, скопировать
-# access_token и вставить его в Authorize (схема HTTPBearer).
+# Регистрация, вход и проверка токена.
+# Вход — JSON, не OAuth2 password form: токен из /auth/login вставляется в Authorize вручную.
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -26,17 +22,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
     },
 )
 def register(payload: UserRegister, session: SessionDep) -> UserRead:
-    """Зарегистрировать пользователя и вернуть его безопасные поля.
+    """Зарегистрировать пользователя.
 
-    Принимаются только `email` и `password`. Email нормализуется
-    (strip + lower) до проверок и до записи. Пароль проверяется по длине
-    в символах и в байтах UTF-8; NUL-символы запрещены. Пароль никогда не
-    возвращается: ответ — `UserRead` (id, email, is_admin), а в ошибках
-    валидации значение `password` замаскировано обработчиком в app/app_factory.py.
-
-    Занятый email → 409. Проверка опирается на UNIQUE(email) в БД, а не на
-    предварительный SELECT: при гонке двух одновременных регистраций
-    вторая получит отказ от базы, и он будет переведён в тот же 409.
+    Занятый email даёт 409; проверка опирается на UNIQUE(email), поэтому гонка тоже даёт 409.
     """
     try:
         return auth_service.register_user(session, payload)
@@ -57,21 +45,9 @@ def register(payload: UserRegister, session: SessionDep) -> UserRead:
     },
 )
 def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
-    """Проверить пару email/пароль и выдать access token.
+    """Проверить email/пароль и выдать access token.
 
-    Пароль сверяется с сохранённым хэшем через `verify_password` (соль
-    внутри хэша, поэтому повторное вычисление и сравнение строк не
-    используется). Если email не найден, выполняется такая же проверка
-    против dummy_hash, и ответ тот же самый — 401 без подробностей: по
-    ответу нельзя понять, существует ли такой адрес.
-
-    Успех: 200 и JSON `{"access_token": "<jwt>", "token_type": "bearer",
-    "user": {...}}`. Токен подписан HS256, живёт 15 минут, sub = id
-    пользователя, iss = sneaker-practice, aud = sneaker-api. Пароля, хэша
-    и признака роли в токене нет.
-
-    Это не OAuth2 password flow: Swagger не умеет логиниться этой формой.
-    Сначала вызовите /auth/login, затем вставьте access_token в Authorize.
+    Для неизвестного email и неверного пароля ответ одинаков: 401.
     """
     try:
         user = auth_service.authenticate_user(session, payload)
@@ -96,16 +72,7 @@ def login(payload: UserLogin, session: SessionDep) -> TokenResponse:
     responses={401: {"description": "Токен отсутствует, просрочен или подделан"}},
 )
 def read_me(current_user: CurrentUser) -> UserRead:
-    """Вернуть пользователя, которому принадлежит предъявленный токен.
-
-    Ответ — UserRead: id, email, is_admin. Пароля и хэша здесь нет ни в
-    каком виде.
-
-    Маршрут существует как рабочая проверка защищённого доступа: 200 только
-    с валидным токеном, 401 во всех остальных случаях (нет заголовка,
-    битая подпись, истёк срок, чужой aud, удалённый пользователь). Он же
-    демонстрирует схему HTTPBearer в OpenAPI.
-    """
+    """Вернуть владельца токена; без валидного токена 401."""
     return current_user
 
 
@@ -119,11 +86,5 @@ def read_me(current_user: CurrentUser) -> UserRead:
     },
 )
 def admin_check(admin: AdminUser) -> UserRead:
-    """Эндпоинт-проверка зависимости require_admin.
-
-    Нужен, чтобы приёмка M3 могла убедиться: обычный пользователь получает
-    403, администратор — 200, а смена роли в БД действует на следующем
-    запросе с уже выданным токеном. Это только проверка доступа — никаких
-    изменений каталога здесь нет (маршруты записи появятся отдельно).
-    """
+    """Проверить доступ администратора: 403 для обычного пользователя."""
     return admin

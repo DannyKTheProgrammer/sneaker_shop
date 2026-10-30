@@ -4,30 +4,7 @@ Revision ID: 201c8afcccba
 Revises:
 Create Date: 2026-10-13 16:41:43.102898
 
-Первая (и пока единственная) ревизия: создаёт brands, products, product_sizes,
-users, cart_items, orders, order_items.
-
-Проверено вручную по заданию:
-  * ровно 7 create_table, включая products.image_url (nullable) и
-    products.description (server_default='');
-  * 7 внешних ключей, все NOT NULL, ни у одного нет ondelete (история
-    заказов не удаляется каскадом);
-  * составные UNIQUE: uq_product_size (product_id, size)
-    и uq_cart_size (user_id, product_size_id);
-  * именованные CHECK: ck_products_price, ck_size_positive, ck_stock,
-    ck_cart_quantity, ck_order_status, ck_order_total, ck_item_quantity,
-    ck_item_price;
-  * nullable и server_default: description '', is_admin false,
-    created_at now(), status 'created'.
-
-Имена FK-ограничений заданы явно (<таблица>_<колонка>_fkey). Autogenerate их
-не проставляет, и тогда PostgreSQL придумывает имена сам; при явных именах
-падение FK в логе и в тексте ошибки называет понятное ограничение, а не
-автосгенерированное. Имена CHECK/UNIQUE/PK сняты с моделей.
-
-Порядок: brands и users создаются первыми (на них ссылаются products,
-orders, cart_items), order_items — последним. downgrade идёт строго
-в обратном порядке, чтобы не уронить FK.
+Создаёт все семь таблиц; downgrade удаляет их в обратном порядке.
 """
 
 from typing import Sequence, Union
@@ -42,7 +19,7 @@ down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# Явные имена FK: PostgreSQL иначе сгенерирует их сам.
+# Явные имена FK (иначе PostgreSQL придумает их сам).
 FK_NAMES = {
     ("orders", "user_id"): "orders_user_id_fkey",
     ("products", "brand_id"): "products_brand_id_fkey",
@@ -55,7 +32,6 @@ FK_NAMES = {
 
 
 def upgrade() -> None:
-    # 1) brands — на неё ссылается products
     op.create_table(
         "brands",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -63,7 +39,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name"),
     )
-    # 2) users — на неё ссылаются orders и cart_items
     op.create_table(
         "users",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -84,7 +59,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("email"),
     )
-    # 3) orders — зависит от users
     op.create_table(
         "orders",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -112,7 +86,6 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    # 4) products — зависит от brands
     op.create_table(
         "products",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -133,7 +106,6 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    # 5) product_sizes — зависит от products
     op.create_table(
         "product_sizes",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -150,7 +122,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("product_id", "size", name="uq_product_size"),
     )
-    # 6) cart_items — зависит от users и product_sizes
     op.create_table(
         "cart_items",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -171,7 +142,6 @@ def upgrade() -> None:
             "user_id", "product_size_id", name="uq_cart_size"
         ),
     )
-    # 7) order_items — зависит от orders и product_sizes
     op.create_table(
         "order_items",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
@@ -196,7 +166,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Строго обратный порядок: сначала таблицы, которые ссылаются на другие.
+    # Сначала таблицы, которые ссылаются на другие.
     op.drop_table("order_items")
     op.drop_table("cart_items")
     op.drop_table("product_sizes")

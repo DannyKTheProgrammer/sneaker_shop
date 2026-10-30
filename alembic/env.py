@@ -1,17 +1,5 @@
-# Окружение Alembic для учебного проекта.
-#
-# Ключевые решения:
-#   1) Пароля и URL в alembic.ini нет. Строка подключения берётся из того же
-#      конфига, что и у приложения: app.core.config -> .env (DATABASE_URL).
-#      Один источник правды: миграции и API ходят в одну и ту же БД.
-#   2) Engine для миграций создаётся свой (poolclass=NullPool), а не берётся
-#      app.database.engine: миграционный процесс — отдельный запуск, и ему
-#      не нужен пул приложения. Настройки подключения при этом те же.
-#   3) target_metadata = Base.metadata: сюда попадают таблицы из app.models,
-#      поэтому импорт моделей обязателен — без него метаданные пусты.
-#   4) compare_type=True: autogenerate сравнивает и типы колонок, а не только
-#      их наличие (иначе смена Numeric(10,2) -> Numeric(12,2) осталась бы
-#      незамеченной).
+# Окружение Alembic: URL берётся из app.core.config (DATABASE_URL), не из alembic.ini.
+# Свой Engine с NullPool; импорт app.models обязателен, иначе метаданные пусты.
 
 from logging.config import fileConfig
 
@@ -26,10 +14,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Подставляем реальный URL из окружения/.env вместо значения из ini.
-# Но если URL уже задан программно (Config.set_main_option в тестах или
-# скриптах приёмки), он главнее: иначе команду нельзя направить в другую
-# БД — миграция молча ушла бы в рабочую базу из .env.
+# URL, заданный программно (тесты, скрипты), главнее .env: иначе миграция уйдёт в рабочую БД.
 def _migration_url() -> str:
     configured = config.get_main_option("sqlalchemy.url", None)
     if configured:
@@ -42,7 +27,6 @@ MIGRATION_URL = _migration_url()
 
 target_metadata = Base.metadata
 
-# Общие для online/offline настройки сравнения схемы с моделями.
 COMPARE_OPTIONS = {
     "compare_type": True,
     "compare_server_default": False,
@@ -50,7 +34,7 @@ COMPARE_OPTIONS = {
 
 
 def run_migrations_offline() -> None:
-    """Offline-режим: SQL генерируется без подключения к БД."""
+    """Сгенерировать SQL без подключения к БД."""
     context.configure(
         url=MIGRATION_URL,
         target_metadata=target_metadata,
@@ -64,7 +48,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Online-режим: миграции применяются к реальной БД."""
+    """Применить миграции к БД."""
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

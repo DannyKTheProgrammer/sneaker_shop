@@ -22,6 +22,7 @@ dist/
 .eggs/
 
 # --- временные вспомогательные скрипты практики ---
+test/
 check_env.py
 *_probe.py
 *_probe.ps1

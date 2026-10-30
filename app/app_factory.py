@@ -1,12 +1,4 @@
-# Общая сборка приложения: состав маршрутов задаётся параметром.
-#
-# Зачем фабрика, а не два почти одинаковых файла: M2 и M3 отличаются ровно
-# одним — подключён ли роутер записи. Дублировать health, роутеры и
-# обработчик ошибок в двух модулях значило бы гарантированно их разъехать.
-#
-#   build_app(include_writes=True)  → app/final_main.py (полный состав M3–M5)
-#   build_app(include_writes=False) → сборка M2 «только чтение»; отдельной
-#                                     точки запуска нет, её поднимают пробы
+# Сборка приложения; include_writes управляет подключением роутеров записи.
 
 import logging
 from collections.abc import AsyncIterator
@@ -30,15 +22,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Управление временем жизни ресурсов приложения.
+    """Освободить пул соединений при остановке приложения.
 
-    При остановке освобождаем пул соединений и закрываем их.
-    Без dispose() соединения остаются висеть до завершения процесса,
-    что мешает аккуратному перезапуску (особенно с --reload).
-
-    Важно: в Windows «жёсткое» убийство процесса (Stop-Process, закрытие
-    окна) не даёт выполнить этот код — срабатывает только штатное завершение
-    (Ctrl+C в терминале, SIGTERM в Linux/контейнере).
+    При жёстком убийстве процесса (Windows) код не выполняется.
     """
     logger.info("Приложение запускается: Engine будет создан лениво при первом запросе")
     yield
@@ -47,14 +33,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def _redact_validation_errors(errors: list[dict]) -> list[dict]:
-    """Убрать из ошибок валидации значения запроса.
-
-    Pydantic кладёт в ошибку само значение поля ('input') и контекст
-    ('ctx'). Для пароля это означало бы вернуть клиенту его же пароль в
-    открытом виде — в том числе когда пароль не подошёл (422). Оставляем
-    только type/loc/msg/url: клиенту этого достаточно, чтобы понять, что
-    именно он прислал не так, а секрет не покидает процесс.
-    """
+    """Убрать из ошибок валидации 'input' и 'ctx', чтобы не вернуть пароль клиенту."""
     return [
         {key: value for key, value in error.items() if key not in ("input", "ctx")}
         for error in errors
@@ -93,22 +72,12 @@ def build_app(*, include_writes: bool) -> FastAPI:
 
     @app.exception_handler(ShopError)
     async def handle_shop_error(request: Request, exc: ShopError) -> JSONResponse:
-        """Ошибки бизнес-уровня (корзина и далее) -> безопасный JSON.
-
-        Один обработчик на всё дерево ShopError вместо «лестницы except» в
-        каждом маршруте: тип исключения сам знает свой HTTP-код и текст
-        (app/core/errors.py). В тело уходит только detail — ни SQL, ни имён
-        ограничений БД, ни traceback.
-        """
+        """Перевести ShopError в JSON с кодом и detail."""
         return await shop_error_handler(request, exc)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
-        """Тот же 422, но без значений полей в теле ответа.
-
-        Нужен из-за регистрации и входа: без маскировки неверный пароль
-        вернулся бы клиенту в поле input.
-        """
+        """422 без значений полей (иначе пароль вернулся бы в input)."""
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": _redact_validation_errors(exc.errors())},
@@ -125,22 +94,14 @@ def build_app(*, include_writes: bool) -> FastAPI:
         },
     )
     def health(response: Response) -> dict[str, str]:
-        """Проверить доступность БД реальным запросом SELECT 1.
+        """Проверить доступность БД запросом SELECT 1.
 
-        /docs и /openapi.json открываются и без БД: они целиком строятся
-        из схемы приложения и к PostgreSQL не обращаются. Поэтому открытие
-        документации НЕ подтверждает, что БД доступна — подтверждает только
-        ответ этого эндпоинта.
+        /docs работает и без БД, поэтому доступность подтверждает только этот эндпоинт.
         """
         try:
             ping()
         except SQLAlchemyError:
-            # Ловим именно ошибки доступа к БД: недоступность сервера,
-            # истёкший statement_timeout, исчерпанный pool_timeout.
-            # Такой except не прячет ошибки остальной программы: например,
-            # ошибка в коде обработчика по-прежнему всплывёт наружу.
-            # Детали (URL, логин, traceback) остаются в логах сервера и
-            # клиенту не отдаются.
+            # Только ошибки БД; детали остаются в логах, клиенту не отдаются.
             logger.exception("Health check: база данных недоступна")
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {"status": "unavailable"}
